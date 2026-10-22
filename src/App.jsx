@@ -950,7 +950,7 @@ export default function App() {
       <div
         style={{
           position: "absolute",
-          bottom: 20,
+          bottom: 100,
           left: 16,
           zIndex: 1000,
           display: "flex",
@@ -995,7 +995,7 @@ export default function App() {
       <div
         style={{
           position: "absolute",
-          bottom: 0,
+          bottom: 100,
           left: 76,
           right: 0,
           zIndex: 1000,
