@@ -4,6 +4,21 @@ import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { initGraph, snap, pathfind } from "./fetch";
 
+const TEAM_COLORS = [
+  "#D50000", // 1. Crimson Red
+  "#FF5500", // 2. Blaze Orange
+  "#C87800", // 3. Amber Gold (calibrated so it doesn't fade on white roads)
+  "#008828", // 5. Kelly Green
+  "#5EA800", // 4. Lime Chartreuse
+  "#0088D6", // 7. Cerulean Cyan
+  "#002BFF", // 8. Cobalt Blue
+  "#5500FF", // 9. Electric Indigo
+  "#FF1464", // 12. Hot Pink
+  "#7B3800", // 13. Burnt Rust / Terracotta (deep warm contrast)
+  "#66002A", // 14. Deep Wine / Burgundy (deep red contrast)
+  "#003866", // 15. Midnight Teal / Petrol (deep cool contrast)
+];
+
 const DOT_CONFIGS = [
   { id: 0, symbol: "👮", name: "Officer" },
   { id: 1, symbol: "🚔", name: "Cruiser" },

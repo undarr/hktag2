@@ -1,8 +1,25 @@
-// App.jsx
+// App.js
 import React, { useEffect, useRef, useState } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { initGraph, snap, pathfind } from "./fetch";
+
+const TEAM_COLORS = [
+  "#D50000", // 1. Crimson Red (Our Team)
+  "#FF5500", // 2. Blaze Orange
+  "#C87800", // 3. Amber Gold
+  "#008828", // 4. Kelly Green
+  "#5EA800", // 5. Lime Chartreuse
+  "#0088D6", // 6. Cerulean Cyan
+  "#002BFF", // 7. Cobalt Blue
+  "#5500FF", // 8. Electric Indigo
+  "#FF1464", // 9. Hot Pink
+  "#7B3800", // 10. Burnt Rust / Terracotta
+  "#66002A", // 11. Deep Wine / Burgundy
+  "#003866", // 12. Midnight Teal / Petrol
+];
+
+const OUR_TEAM_COLOR = TEAM_COLORS[0];
 
 const DOT_CONFIGS = [
   { id: 0, symbol: "👮", name: "Officer" },
@@ -10,6 +27,13 @@ const DOT_CONFIGS = [
   { id: 2, symbol: "🚁", name: "Chopper" },
   { id: 3, symbol: "🏃", name: "Runner" },
 ];
+
+const STATE_COLORS = {
+  Move: "#2e7d32",
+  Ferry: "#0288d1",
+  Redirecting: "#ed6c02",
+  Stop: "#757575",
+};
 
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000.0;
@@ -22,34 +46,79 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Updated Glowing Icon Generator
-function createDotIcon(symbol, color, isStrongGlow) {
-  const filter = isStrongGlow
-    ? `drop-shadow(0 0 3px ${color}) drop-shadow(0 0 4px ${color}) drop-shadow(0 0 8px ${color})`
-    : `drop-shadow(0 0 3px ${color}) drop-shadow(0 0 8px ${color})`;
-
-  return L.divIcon({
-    className: "dot-emoji-icon",
-    html: `<div style="font-size: ${isStrongGlow ? "20px" : "18px"}; line-height: 18px; text-align: center; user-select: none; cursor: pointer; filter: ${filter}; transform: ${isStrongGlow ? "scale(1.2)" : "scale(1)"}; transition: transform 0.2s ease;">${symbol}</div>`,
-    iconSize: [20, 20],
-    iconAnchor: [10, 10],
-  });
+function getPixelRadius(map, centerLatLng, meters) {
+  if (!map || meters <= 0) return 0;
+  const centerPt = map.latLngToLayerPoint(centerLatLng);
+  const offsetLatLng = L.latLng(centerLatLng[0] + meters / 111139.0, centerLatLng[1]);
+  const offsetPt = map.latLngToLayerPoint(offsetLatLng);
+  return Math.hypot(centerPt.x - offsetPt.x, centerPt.y - offsetPt.y);
 }
 
-function getStateColor(state) {
-  switch (state) {
-    case "Move":
-      return "#2e7d32";
-    case "Ferry":
-      return "#0288d1";
-    case "Redirecting":
-      return "#ed6c02";
-    default:
-      return "#757575";
+const iconTextureCache = new Map();
+
+function getPrebakedEmojiIcon(symbol, color = OUR_TEAM_COLOR, isStrongGlow = false, opacity = 1.0) {
+  const cacheKey = `${symbol}_${color}_${isStrongGlow}_${opacity}`;
+  if (iconTextureCache.has(cacheKey)) {
+    return iconTextureCache.get(cacheKey);
   }
+
+  const displaySize = isStrongGlow ? 48 : 40;
+  const scale = 2;
+  const canvasSize = displaySize * scale;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = canvasSize;
+  canvas.height = canvasSize;
+  const ctx = canvas.getContext("2d");
+
+  const center = canvasSize / 2;
+
+  ctx.save();
+  ctx.globalAlpha = opacity;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  const fontSize = isStrongGlow ? 22 * scale : 19 * scale;
+  ctx.font = `${fontSize}px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif`;
+
+  if (isStrongGlow) {
+    ctx.shadowColor = "#ffffff";
+    ctx.shadowBlur = 18 * scale;
+    ctx.fillText(symbol, center, center);
+
+    ctx.shadowBlur = 10 * scale;
+    ctx.fillText(symbol, center, center);
+
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 6 * scale;
+    ctx.fillText(symbol, center, center);
+    ctx.fillText(symbol, center, center);
+  } else {
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 12 * scale;
+    ctx.fillText(symbol, center, center);
+
+    ctx.shadowBlur = 6 * scale;
+    ctx.fillText(symbol, center, center);
+
+    ctx.shadowBlur = 3 * scale;
+    ctx.fillText(symbol, center, center);
+  }
+
+  ctx.shadowBlur = 0;
+  ctx.fillText(symbol, center, center);
+  ctx.restore();
+
+  const icon = L.icon({
+    iconUrl: canvas.toDataURL("image/png"),
+    iconSize: [displaySize, displaySize],
+    iconAnchor: [displaySize / 2, displaySize / 2],
+  });
+
+  iconTextureCache.set(cacheKey, icon);
+  return icon;
 }
 
-// Split waypoints into land (jungle green) and water (ocean blue) segments
 function buildPathSegments(dot) {
   const { pos, waypoints, waterFlags, segIdx } = dot;
   if (!waypoints || waypoints.length <= 1 || segIdx >= waypoints.length - 1) {
@@ -93,47 +162,51 @@ function buildPathSegments(dot) {
 export default function App() {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
+  const fogRendererRef = useRef(null);
   const defaultBboxRef = useRef(null);
 
-  // Mobile pinch-zoom guard
-  const isZoomingRef = useRef(false);
+  const [gameStarted, setGameStarted] = useState(false);
+  const gameStartedRef = useRef(false);
 
-  // Selected State
+  const isZoomingRef = useRef(false);
+  const teamZIndexCounter = useRef(1000);
+
   const [selectedId, setSelectedId] = useState(null);
   const selectedIdRef = useRef(null);
 
-  // Reactive UI state for all 4 dots
   const [dotsUI, setDotsUI] = useState(
     DOT_CONFIGS.map((cfg) => ({
       id: cfg.id,
-      symbol: cfg.symbol,
       name: cfg.name,
+      symbol: cfg.symbol,
       state: "Stop",
       eta: "--",
       timeLeft: "--",
       distLeft: "--",
       speed: 20.0,
       radius: 25,
+      sight: 500,
     }))
   );
 
-  // Engine state kept in refs for high-speed simulation
   const dotsRef = useRef(
-    DOT_CONFIGS.map((cfg) => ({
+    DOT_CONFIGS.map((cfg, idx) => ({
       id: cfg.id,
-      symbol: cfg.symbol,
       name: cfg.name,
+      symbol: cfg.symbol,
       pos: [22.3193, 114.1694],
       state: "Stop",
       speed: 20.0,
       radius: 25,
+      sight: 500,
+      zIndex: (4 - idx) * 100,
       waypoints: [],
       waterFlags: [],
       segIdx: 0,
-      distLeft: "--",
       nextAllowedClick: 0,
       redirectStart: 0,
       ferryTarget: null,
+      distLeft: "--",
       layers: {
         dotOuter: null,
         dotEmoji: null,
@@ -144,77 +217,193 @@ export default function App() {
     }))
   );
 
-  // 1. Initialize Map and Dots
+  const opponentsRef = useRef([]);
+
+  // Synchronous, zero-flicker fog drawing logic
+  const renderFog = () => {
+    const fogRenderer = fogRendererRef.current;
+    const map = mapRef.current;
+    if (!fogRenderer || !fogRenderer._container || !fogRenderer._ctx || !map) return;
+
+    const ctx = fogRenderer._ctx;
+    const bounds = fogRenderer._bounds;
+    if (!bounds) return;
+
+    const size = bounds.getSize();
+    const min = bounds.min;
+
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (L.Browser.retina) {
+      ctx.scale(2, 2);
+    }
+    ctx.translate(-min.x, -min.y);
+
+    ctx.clearRect(min.x, min.y, size.x, size.y);
+
+    if (gameStartedRef.current) {
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+      ctx.fillRect(min.x, min.y, size.x, size.y);
+
+      ctx.globalCompositeOperation = "destination-out";
+
+      dotsRef.current.forEach((dot) => {
+        const pt = map.latLngToLayerPoint(dot.pos);
+        const innerMeters = Math.max(0, dot.sight - 100);
+        const outerMeters = dot.sight + 100;
+
+        const rInner = getPixelRadius(map, dot.pos, innerMeters);
+        const rOuter = getPixelRadius(map, dot.pos, outerMeters);
+
+        if (rOuter > 0) {
+          const grad = ctx.createRadialGradient(pt.x, pt.y, rInner, pt.x, pt.y, rOuter);
+          grad.addColorStop(0, "rgba(0, 0, 0, 1)");
+          grad.addColorStop(1, "rgba(0, 0, 0, 0)");
+
+          ctx.fillStyle = grad;
+          ctx.beginPath();
+          ctx.arc(pt.x, pt.y, rOuter, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      });
+    }
+
+    ctx.restore();
+  };
+
+  // 1. Initialize Map, Panes, Team & Opponents
   useEffect(() => {
     if (!mapRef.current) {
       const map = L.map(mapContainerRef.current, {
-        minZoom: 10,
+        minZoom: 11,
+        zoomControl: false,
         zoomAnimation: true,
         zoomAnimationDuration: 0.15,
         wheelDebounceTime: 15,
         wheelPxPerZoomLevel: 90,
       }).setView([22.3193, 114.1694], 12);
 
+      // Tile layer with aggressive buffer caching to eliminate raster tile flicker
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        minZoom: 10,
+        minZoom: 11,
         maxZoom: 19,
-        attribution: "© OpenStreetMap",
+        attribution: false,
+        keepBuffer: 16, // Keeps 16 rows/cols of tiles cached outside view
+        updateWhenIdle: false, // Load continuously
+        updateWhenZooming: false,
+        updateInterval: 80,
       }).addTo(map);
 
-      const vectorRenderer = L.svg({ padding: 0.5 });
+      // --- CREATION OF STRICT Z-INDEX PANES ---
+      // 9. Circle of remaining opponents (zIndex: 300)
+      map.createPane("outOfSightOpponentCirclesPane");
+      map.getPane("outOfSightOpponentCirclesPane").style.zIndex = 300;
+
+      // 8. Remaining opponents (zIndex: 350)
+      map.createPane("outOfSightOpponentsPane");
+      map.getPane("outOfSightOpponentsPane").style.zIndex = 350;
+
+      // 7. Fog Pane (zIndex: 400)
+      map.createPane("fogPane");
+      map.getPane("fogPane").style.zIndex = 400;
+
+      // Broad padding (0.8) so chunk updates happen far outside view
+      const fogRenderer = L.canvas({ pane: "fogPane", padding: 0.8 });
+      fogRenderer.addTo(map);
+      fogRendererRef.current = fogRenderer;
+
+      // CRUCIAL: Hook directly into Leaflet's synchronous _draw step.
+      // Whenever Leaflet resizes the canvas for a new chunk, it calls _draw synchronously
+      // before the frame is painted to the display, eliminating the blank flicker completely!
+      fogRenderer._draw = () => {
+        renderFog();
+      };
+
+      // 6. Circle of opponents within sight (zIndex: 450)
+      map.createPane("inSightOpponentCirclesPane");
+      map.getPane("inSightOpponentCirclesPane").style.zIndex = 450;
+
+      // 5. Circle of team members (zIndex: 500)
+      map.createPane("teamCirclesPane");
+      map.getPane("teamCirclesPane").style.zIndex = 500;
+
+      // 4. Path routes (zIndex: 550)
+      map.createPane("pathsPane");
+      map.getPane("pathsPane").style.zIndex = 550;
+
+      // 3. All opponents within sight (zIndex: 600)
+      map.createPane("inSightOpponentsPane");
+      map.getPane("inSightOpponentsPane").style.zIndex = 600;
+
+      // 2. All team members (zIndex: 650)
+      map.createPane("teamMembersPane");
+      map.getPane("teamMembersPane").style.zIndex = 650;
+
+      const teamCirclesRenderer = L.canvas({ padding: 0.8, pane: "teamCirclesPane" });
+      const pathsRenderer = L.canvas({ padding: 0.8, pane: "pathsPane" });
+      const inSightCirclesRenderer = L.canvas({ padding: 0.8, pane: "inSightOpponentCirclesPane" });
+      const outOfSightCirclesRenderer = L.canvas({ padding: 0.8, pane: "outOfSightOpponentCirclesPane" });
 
       dotsRef.current.forEach((dot) => {
         const dotOuter = L.circle(dot.pos, {
-          renderer: vectorRenderer,
+          renderer: teamCirclesRenderer,
+          pane: "teamCirclesPane",
           radius: dot.radius,
-          color: "#ff0000",
+          color: OUR_TEAM_COLOR,
           weight: 1,
-          fillColor: "#ff0000",
+          fillColor: OUR_TEAM_COLOR,
           fillOpacity: 0.25,
+          interactive: false,
         }).addTo(map);
 
         const dotEmoji = L.marker(dot.pos, {
-          icon: createDotIcon(dot.symbol, "#ff0000", false),
-          interactive: true,
+          icon: getPrebakedEmojiIcon(dot.symbol, OUR_TEAM_COLOR, false, 1.0),
+          pane: "teamMembersPane",
+          zIndexOffset: dot.zIndex,
+          interactive: false,
         }).addTo(map);
 
-        dotEmoji.on("click", (e) => {
-          L.DomEvent.stopPropagation(e);
-          handleToggleSelect(dot.id);
-        });
-
         const landPath = L.polyline([], {
-          renderer: vectorRenderer,
+          renderer: pathsRenderer,
+          pane: "pathsPane",
           color: "#1e824c",
           weight: 5,
           opacity: 0.55,
+          interactive: false,
         }).addTo(map);
 
         const waterPath = L.polyline([], {
-          renderer: vectorRenderer,
+          renderer: pathsRenderer,
+          pane: "pathsPane",
           color: "#0077be",
           weight: 5,
           opacity: 0.55,
+          interactive: false,
         }).addTo(map);
 
         const hollowDest = L.circle([0, 0], {
-          renderer: vectorRenderer,
+          renderer: teamCirclesRenderer,
+          pane: "teamCirclesPane",
           radius: 15,
-          color: "#ff0000",
+          color: OUR_TEAM_COLOR,
           weight: 2,
           dashArray: "6, 6",
           fill: false,
+          interactive: false,
         }).addTo(map);
 
         dot.layers = { dotOuter, dotEmoji, landPath, waterPath, hollowDest };
       });
 
+      // Zoom lifecycle events
       map.on("zoomstart", () => {
         isZoomingRef.current = true;
       });
 
       map.on("zoomend", () => {
         isZoomingRef.current = false;
+
         dotsRef.current.forEach((dot) => {
           dot.layers.dotOuter.setLatLng(dot.pos);
           dot.layers.dotEmoji.setLatLng(dot.pos);
@@ -223,6 +412,8 @@ export default function App() {
           dot.layers.landPath.setLatLngs(landMulti);
           dot.layers.waterPath.setLatLngs(waterMulti);
         });
+
+        renderFog();
       });
 
       mapRef.current = map;
@@ -232,22 +423,83 @@ export default function App() {
           defaultBboxRef.current = bbox;
           map.fitBounds(bbox);
 
-          for (let i = 0; i < 4; i++) {
+          const playerSnapPromises = dotsRef.current.map(() => {
             const randLat = bbox[0][0] + Math.random() * (bbox[1][0] - bbox[0][0]);
             const randLon = bbox[0][1] + Math.random() * (bbox[1][1] - bbox[0][1]);
-            const initialSnap = await snap(randLat, randLon);
+            return snap(randLat, randLon);
+          });
 
+          const playerSnaps = await Promise.all(playerSnapPromises);
+          playerSnaps.forEach((res, i) => {
             const dot = dotsRef.current[i];
-            dot.pos = initialSnap.pt;
-            dot.layers.dotOuter.setLatLng(initialSnap.pt);
-            dot.layers.dotEmoji.setLatLng(initialSnap.pt);
+            dot.pos = res.pt;
+            dot.layers.dotOuter.setLatLng(res.pt);
+            dot.layers.dotEmoji.setLatLng(res.pt);
+          });
+
+          const opponentPromises = [];
+          for (let teamIdx = 1; teamIdx < TEAM_COLORS.length; teamIdx++) {
+            const teamColor = TEAM_COLORS[teamIdx];
+            DOT_CONFIGS.forEach((cfg) => {
+              const randLat = bbox[0][0] + Math.random() * (bbox[1][0] - bbox[0][0]);
+              const randLon = bbox[0][1] + Math.random() * (bbox[1][1] - bbox[0][1]);
+              opponentPromises.push(
+                snap(randLat, randLon).then((res) => ({
+                  pt: res.pt,
+                  symbol: cfg.symbol,
+                  teamColor,
+                }))
+              );
+            });
           }
+
+          const opponentUnits = await Promise.all(opponentPromises);
+          opponentsRef.current = opponentUnits.map(({ pt, symbol, teamColor }) => {
+            const circleInSight = L.circle(pt, {
+              renderer: inSightCirclesRenderer,
+              pane: "inSightOpponentCirclesPane",
+              radius: 25,
+              color: teamColor,
+              weight: 1,
+              opacity: 0,
+              fillColor: teamColor,
+              fillOpacity: 0,
+              interactive: false,
+            }).addTo(map);
+
+            const circleOutOfSight = L.circle(pt, {
+              renderer: outOfSightCirclesRenderer,
+              pane: "outOfSightOpponentCirclesPane",
+              radius: 25,
+              color: teamColor,
+              weight: 1,
+              opacity: 0.5,
+              fillColor: teamColor,
+              fillOpacity: 0.125,
+              interactive: false,
+            }).addTo(map);
+
+            const marker = L.marker(pt, {
+              icon: getPrebakedEmojiIcon(symbol, teamColor, false, 1.0),
+              pane: "outOfSightOpponentsPane",
+              interactive: false,
+            }).addTo(map);
+
+            return {
+              pos: pt,
+              symbol,
+              teamColor,
+              circleInSight,
+              circleOutOfSight,
+              marker,
+            };
+          });
         })
         .catch((err) => console.error("Init Error:", err));
     }
   }, []);
 
-  // 2. High-Performance Movement Engine (60 FPS)
+  // 2. High-Performance Movement, Scaling & Synchronous Fog Loop (60 FPS)
   useEffect(() => {
     let animId;
     let lastTime = performance.now();
@@ -262,94 +514,176 @@ export default function App() {
         isZoomingRef.current ||
         Boolean(map && (map._animatingZoom || map._zooming || (map.touchZoom && map.touchZoom._zooming)));
 
-      dotsRef.current.forEach((dot) => {
-        const { state, waypoints, layers } = dot;
-        let segIdx = dot.segIdx;
+      const isStarted = gameStartedRef.current;
 
-        const isFerryRedirect = state === "Redirecting" && dot.ferryTarget !== null;
-        const canMove = state === "Move" || state === "Ferry" || isFerryRedirect;
+      // 1. Team Movement
+      if (isStarted) {
+        dotsRef.current.forEach((dot) => {
+          const { state, waypoints, layers } = dot;
+          let segIdx = dot.segIdx;
 
-        if (canMove && waypoints.length > 1 && segIdx < waypoints.length - 1) {
-          let distanceToAdvance = dot.speed * dt;
+          const isFerryRedirect = state === "Redirecting" && dot.ferryTarget !== null;
+          const canMove = state === "Move" || state === "Ferry" || isFerryRedirect;
 
-          while (distanceToAdvance > 0 && segIdx < waypoints.length - 1) {
-            if (isFerryRedirect && dot.ferryTarget) {
-              if (segIdx >= dot.ferryTarget.nodeIdx) {
-                dot.pos = waypoints[dot.ferryTarget.nodeIdx];
+          if (canMove && waypoints.length > 1 && segIdx < waypoints.length - 1) {
+            let distanceToAdvance = dot.speed * dt;
+
+            while (distanceToAdvance > 0 && segIdx < waypoints.length - 1) {
+              if (isFerryRedirect && dot.ferryTarget) {
+                if (segIdx >= dot.ferryTarget.nodeIdx) {
+                  dot.pos = waypoints[dot.ferryTarget.nodeIdx];
+                  distanceToAdvance = 0;
+                  break;
+                }
+              }
+
+              const p1 = dot.pos;
+              const p2 = waypoints[segIdx + 1];
+              const segDist = haversineMeters(p1[0], p1[1], p2[0], p2[1]);
+
+              if (distanceToAdvance < segDist) {
+                const t = distanceToAdvance / segDist;
+                dot.pos = [p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t];
                 distanceToAdvance = 0;
-                break;
+              } else {
+                distanceToAdvance -= segDist;
+                dot.pos = p2;
+                segIdx++;
+                dot.segIdx = segIdx;
+
+                if (isFerryRedirect && dot.ferryTarget && segIdx >= dot.ferryTarget.nodeIdx) {
+                  distanceToAdvance = 0;
+                  break;
+                }
               }
             }
 
-            const p1 = dot.pos;
-            const p2 = waypoints[segIdx + 1];
-            const segDist = haversineMeters(p1[0], p1[1], p2[0], p2[1]);
+            if (!isZooming) {
+              layers.dotOuter.setLatLng(dot.pos);
+              layers.dotEmoji.setLatLng(dot.pos);
 
-            if (distanceToAdvance < segDist) {
-              const t = distanceToAdvance / segDist;
-              dot.pos = [p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t];
-              distanceToAdvance = 0;
+              const { landMulti, waterMulti } = buildPathSegments(dot);
+              layers.landPath.setLatLngs(landMulti);
+              layers.waterPath.setLatLngs(waterMulti);
+            }
+
+            if (state !== "Redirecting") {
+              const isWater = dot.waterFlags[segIdx] === 1;
+              dot.state = isWater ? "Ferry" : "Move";
+            }
+
+            if (segIdx >= waypoints.length - 1) {
+              dot.state = "Stop";
+              dot.waypoints = [];
+              layers.landPath.setLatLngs([]);
+              layers.waterPath.setLatLngs([]);
+              dot.timeLeft = "--";
+              dot.eta = "--";
+              dot.distLeft = "--";
             } else {
-              distanceToAdvance -= segDist;
-              dot.pos = p2;
-              segIdx++;
-              dot.segIdx = segIdx;
-
-              if (isFerryRedirect && dot.ferryTarget && segIdx >= dot.ferryTarget.nodeIdx) {
-                distanceToAdvance = 0;
-                break;
+              let remDist = haversineMeters(dot.pos[0], dot.pos[1], waypoints[segIdx + 1][0], waypoints[segIdx + 1][1]);
+              for (let i = segIdx + 1; i < waypoints.length - 1; i++) {
+                remDist += haversineMeters(waypoints[i][0], waypoints[i][1], waypoints[i + 1][0], waypoints[i + 1][1]);
               }
+              const remSec = remDist / dot.speed;
+              dot.timeLeft = remSec.toFixed(1) + "s";
+              const etaDate = new Date(Date.now() + remSec * 1000);
+              dot.eta = etaDate.toLocaleTimeString([], { hour12: false });
+              dot.distLeft = remDist > 1000 ? (remDist / 1000).toFixed(2) + " km" : remDist.toFixed(0) + " m";
             }
           }
+        });
+      }
 
-          if (!isZooming) {
-            layers.dotOuter.setLatLng(dot.pos);
-            layers.dotEmoji.setLatLng(dot.pos);
+      // 2. Opponent Dynamics & Pane/Z-Index Sorting
+      if (map && opponentsRef.current.length > 0) {
+        const teamMembers = dotsRef.current;
 
-            const { landMulti, waterMulti } = buildPathSegments(dot);
-            layers.landPath.setLatLngs(landMulti);
-            layers.waterPath.setLatLngs(waterMulti);
+        opponentsRef.current.forEach((opp) => {
+          if (!isStarted) {
+            if (opp.marker && opp.marker._icon) {
+              opp.marker._icon.style.width = "40px";
+              opp.marker._icon.style.height = "40px";
+              opp.marker._icon.style.marginLeft = "-20px";
+              opp.marker._icon.style.marginTop = "-20px";
+            }
+            return;
           }
 
-          if (state !== "Redirecting") {
-            const isWater = dot.waterFlags[segIdx] === 1;
-            dot.state = isWater ? "Ferry" : "Move";
+          let minT = Infinity;
+          let inSight = false;
+
+          for (let m = 0; m < teamMembers.length; m++) {
+            const member = teamMembers[m];
+            const dist = haversineMeters(member.pos[0], member.pos[1], opp.pos[0], opp.pos[1]);
+            if (dist <= member.sight) {
+              inSight = true;
+            }
+            const s = Math.max(0.1, member.speed);
+            const t = dist / s;
+            if (t < minT) minT = t;
           }
 
-          if (segIdx >= waypoints.length - 1) {
-            dot.state = "Stop";
-            dot.waypoints = [];
-            layers.landPath.setLatLngs([]);
-            layers.waterPath.setLatLngs([]);
-            dot.timeLeft = "--";
-            dot.eta = "--";
-            dot.distLeft = "--";
+          let scale = 1.0;
+          if (minT <= 5) {
+            scale = 1.0;
+          } else if (minT >= 60) {
+            scale = 0.4;
           } else {
-            let remDist = haversineMeters(dot.pos[0], dot.pos[1], waypoints[segIdx + 1][0], waypoints[segIdx + 1][1]);
-            for (let i = segIdx + 1; i < waypoints.length - 1; i++) {
-              remDist += haversineMeters(waypoints[i][0], waypoints[i][1], waypoints[i + 1][0], waypoints[i + 1][1]);
-            }
-            const remSec = remDist / dot.speed;
-            dot.timeLeft = remSec.toFixed(1) + "s";
-            dot.distLeft = remDist > 1000 ? (remDist / 1000).toFixed(2) + " km" : Math.round(remDist) + " m";
-            const etaDate = new Date(Date.now() + remSec * 1000);
-            dot.eta = etaDate.toLocaleTimeString([], { hour12: false });
+            scale = 1.0 - 0.6 * ((minT - 5) / 55.0);
           }
-        }
-      });
 
+          if (opp.marker && opp.marker._icon) {
+            const size = Math.round(40 * scale);
+            const half = Math.round(size / 2);
+            opp.marker._icon.style.width = `${size}px`;
+            opp.marker._icon.style.height = `${size}px`;
+            opp.marker._icon.style.marginLeft = `-${half}px`;
+            opp.marker._icon.style.marginTop = `-${half}px`;
+
+            const targetPaneName = inSight ? "inSightOpponentsPane" : "outOfSightOpponentsPane";
+            const targetPaneElem = map.getPane(targetPaneName);
+            if (targetPaneElem && opp.marker._icon.parentNode !== targetPaneElem) {
+              targetPaneElem.appendChild(opp.marker._icon);
+            }
+
+            if (inSight) {
+              const zOffset = Math.round(10000 - Math.min(10000, minT * 100));
+              opp.marker.setZIndexOffset(zOffset);
+            } else {
+              opp.marker.setZIndexOffset(0);
+            }
+          }
+
+          if (inSight) {
+            opp.circleInSight.setStyle({ opacity: 0.5, fillOpacity: 0.125 });
+            opp.circleOutOfSight.setStyle({ opacity: 0, fillOpacity: 0 });
+          } else {
+            opp.circleInSight.setStyle({ opacity: 0, fillOpacity: 0 });
+            opp.circleOutOfSight.setStyle({ opacity: 0.5, fillOpacity: 0.125 });
+          }
+        });
+      }
+
+      // 3. Render Fog during animation (if not zoom animating)
+      if (!isZooming) {
+        renderFog();
+      }
+
+      // UI Sync
       if (now - lastUIUpdate > 100) {
         setDotsUI(
           dotsRef.current.map((d) => ({
             id: d.id,
-            symbol: d.symbol,
             name: d.name,
+            symbol: d.symbol,
             state: d.state,
             eta: d.eta,
             timeLeft: d.timeLeft,
             distLeft: d.distLeft,
             speed: d.speed,
             radius: d.radius,
+            sight: d.sight,
           }))
         );
         lastUIUpdate = now;
@@ -362,8 +696,9 @@ export default function App() {
     return () => cancelAnimationFrame(animId);
   }, []);
 
-  // 3. Selection & Animation Logic
+  // 3. Selection & Dynamic Team Member zIndex
   const handleToggleSelect = (id) => {
+    if (!gameStartedRef.current) return;
     const map = mapRef.current;
     if (!map) return;
 
@@ -372,9 +707,6 @@ export default function App() {
     if (selectedIdRef.current === id) {
       selectedIdRef.current = null;
       setSelectedId(null);
-      if (defaultBboxRef.current) {
-        map.fitBounds(defaultBboxRef.current, { animate: true, duration: 0.7 });
-      }
     } else {
       nextSelectedId = id;
       selectedIdRef.current = id;
@@ -382,27 +714,31 @@ export default function App() {
       const dot = dotsRef.current[id];
       if (dot) {
         map.panTo(dot.pos, { animate: true, duration: 0.6 });
+
+        teamZIndexCounter.current += 10;
+        dot.zIndex = teamZIndexCounter.current;
+        if (dot.layers.dotEmoji) {
+          dot.layers.dotEmoji.setZIndexOffset(dot.zIndex);
+        }
       }
     }
 
     dotsRef.current.forEach((d) => {
       if (d.layers.dotEmoji) {
-        d.layers.dotEmoji.setIcon(createDotIcon(d.symbol, "#ff0000", d.id === nextSelectedId));
+        d.layers.dotEmoji.setIcon(
+          getPrebakedEmojiIcon(d.symbol, OUR_TEAM_COLOR, d.id === nextSelectedId, 1.0)
+        );
       }
     });
   };
 
-  const handleDeselect = () => {
-    if (selectedIdRef.current !== null) {
-      handleToggleSelect(selectedIdRef.current);
-    }
-  };
-
-  // 4. Targeted Map Click Rerouting
+  // 4. Targeted Map Click Rerouting (Blocked before game starts)
   useEffect(() => {
     if (!mapRef.current) return;
 
     const onMapClick = async (e) => {
+      if (!gameStartedRef.current) return;
+
       const activeId = selectedIdRef.current;
       if (activeId === null) return;
 
@@ -506,24 +842,43 @@ export default function App() {
     return () => map.off("click", onMapClick);
   }, []);
 
-  // --- CONTROL BUTTON HANDLERS ---
+  // --- START GAME HANDLER ---
+  const handleStartGame = () => {
+    gameStartedRef.current = true;
+    setGameStarted(true);
+    renderFog();
+  };
+
+  // --- BUTTON HANDLERS ---
   const handleAddSpeed = (id, e) => {
-    e?.stopPropagation();
+    e.stopPropagation();
+    if (!gameStartedRef.current) return;
     const dot = dotsRef.current[id];
-    dot.speed += 5.0;
+    if (dot) dot.speed += 5.0;
   };
 
   const handleAddRadius = (id, e) => {
-    e?.stopPropagation();
+    e.stopPropagation();
+    if (!gameStartedRef.current) return;
     const dot = dotsRef.current[id];
-    dot.radius += 10;
-    if (dot.layers.dotOuter) dot.layers.dotOuter.setRadius(dot.radius);
+    if (dot) {
+      dot.radius += 10;
+      if (dot.layers.dotOuter) dot.layers.dotOuter.setRadius(dot.radius);
+    }
+  };
+
+  const handleAddSight = (id, e) => {
+    e.stopPropagation();
+    if (!gameStartedRef.current) return;
+    const dot = dotsRef.current[id];
+    if (dot) dot.sight += 50;
   };
 
   const handleTeleport = (id, e) => {
-    e?.stopPropagation();
+    e.stopPropagation();
+    if (!gameStartedRef.current) return;
     const dot = dotsRef.current[id];
-    if (!dot.waypoints || dot.waypoints.length === 0) return;
+    if (!dot || !dot.waypoints || dot.waypoints.length === 0) return;
 
     const destCoord = dot.waypoints[dot.waypoints.length - 1];
     dot.pos = destCoord;
@@ -543,42 +898,7 @@ export default function App() {
     dot.distLeft = "--";
   };
 
-  // Currently selected dot for the popup
-  const activeDotUI = dotsUI.find((d) => d.id === selectedId) || null;
-
-  // Render button for an agent
-  const renderCircleButton = (dot) => {
-    const isSelected = selectedId === dot.id;
-    const isMoving = dot.state !== "Stop";
-    const stateColor = getStateColor(dot.state);
-
-    return (
-      <button
-        key={dot.id}
-        onClick={() => handleToggleSelect(dot.id)}
-        style={{
-          width: "54px",
-          height: "54px",
-          borderRadius: "50%",
-          backgroundColor: isSelected ? "#fff9c4" : "#ffffff", // tints yellow when selected
-          border: isMoving ? `3.5px solid ${stateColor}` : "none", // border only when moving
-          boxShadow: isSelected
-            ? "0 4px 18px rgba(255, 214, 0, 0.65), 0 2px 8px rgba(0,0,0,0.25)"
-            : "0 3px 12px rgba(0, 0, 0, 0.2)",
-          cursor: "pointer",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          fontSize: "24px",
-          outline: "none",
-          transition: "all 0.25s ease",
-          userSelect: "none",
-        }}
-      >
-        {dot.symbol}
-      </button>
-    );
-  };
+  const selectedDotUI = dotsUI.find((d) => d.id === selectedId);
 
   return (
     <div
@@ -593,134 +913,169 @@ export default function App() {
         overflow: "hidden",
       }}
     >
-      {/* 2 Circle Buttons on Left Side */}
+      {/* 1. White Round Start Game Button on Top-Left (zIndex: 1100) */}
+      {!gameStarted && (
+        <button
+          onClick={handleStartGame}
+          title="Start Game"
+          style={{
+            position: "absolute",
+            top: 20,
+            left: 20,
+            zIndex: 1100,
+            width: "52px",
+            height: "52px",
+            borderRadius: "50%",
+            backgroundColor: "#ffffff",
+            border: "none",
+            boxShadow: "0 4px 14px rgba(0, 0, 0, 0.25)",
+            fontSize: "24px",
+            color: "#111",
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            userSelect: "none",
+            outline: "none",
+            transition: "transform 0.15s ease",
+          }}
+          onMouseDown={(e) => (e.currentTarget.style.transform = "scale(0.92)")}
+          onMouseUp={(e) => (e.currentTarget.style.transform = "scale(1)")}
+        >
+          ▷
+        </button>
+      )}
+
+      {/* 4 White Circle Buttons on Bottom-Left in a Vertical Line (zIndex: 1000) */}
       <div
         style={{
           position: "absolute",
-          left: 20,
-          top: "50%",
-          transform: "translateY(-50%)",
+          bottom: 20,
+          left: 16,
           zIndex: 1000,
           display: "flex",
           flexDirection: "column",
-          gap: "18px",
+          gap: "10px",
         }}
       >
-        {dotsUI.slice(0, 2).map((dot) => renderCircleButton(dot))}
+        {dotsUI.map((dot) => {
+          const isSelected = selectedId === dot.id;
+          const isMoving = dot.state !== "Stop";
+          const borderColor = isMoving ? STATE_COLORS[dot.state] || "#2e7d32" : "transparent";
+
+          return (
+            <button
+              key={dot.id}
+              onClick={() => handleToggleSelect(dot.id)}
+              style={{
+                width: "48px",
+                height: "48px",
+                borderRadius: "50%",
+                backgroundColor: isSelected ? "#fff9c4" : "#ffffff",
+                border: isMoving ? `2.5px solid ${borderColor}` : "2.5px solid transparent",
+                boxShadow: "0 2px 8px rgba(0, 0, 0, 0.25)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontSize: "22px",
+                cursor: "pointer",
+                transition: "background-color 0.2s ease, border-color 0.2s ease",
+                outline: "none",
+                userSelect: "none",
+                padding: 0,
+              }}
+            >
+              {dot.symbol}
+            </button>
+          );
+        })}
       </div>
 
-      {/* 2 Circle Buttons on Right Side */}
+      {/* Slide-Up Popup Panel (zIndex: 1000) */}
       <div
         style={{
           position: "absolute",
-          right: 20,
-          top: "50%",
-          transform: "translateY(-50%)",
+          bottom: 0,
+          left: 76,
+          right: 0,
           zIndex: 1000,
-          display: "flex",
-          flexDirection: "column",
-          gap: "18px",
-        }}
-      >
-        {dotsUI.slice(2, 4).map((dot) => renderCircleButton(dot))}
-      </div>
-
-      {/* 70% Width Slide-Up Popup Modal */}
-      <div
-        style={{
-          position: "absolute",
-          bottom: 24,
-          left: "50%",
-          width: "70%",
-          maxWidth: "880px",
-          zIndex: 1001,
-          transform: selectedId !== null ? "translateX(-50%) translateY(0%)" : "translateX(-50%) translateY(140%)",
-          transition: "transform 0.35s cubic-bezier(0.2, 0.9, 0.3, 1)",
-          pointerEvents: selectedId !== null ? "auto" : "none",
-          backgroundColor: "rgba(255, 255, 255, 0.96)",
-          backdropFilter: "blur(12px)",
-          borderRadius: "24px",
-          boxShadow: "0 14px 38px rgba(0, 0, 0, 0.25)",
-          padding: "16px 24px",
+          backgroundColor: "rgba(255, 255, 255, 0.95)",
+          backdropFilter: "blur(8px)",
+          boxShadow: "0 -4px 16px rgba(0, 0, 0, 0.15)",
+          borderTop: "1.5px solid #e0e0e0",
+          borderTopLeftRadius: "16px",
+          padding: "12px 18px 24px",
           fontFamily: "system-ui, -apple-system, sans-serif",
-          boxSizing: "border-box",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          flexWrap: "wrap",
+          gap: "12px",
+          transform: selectedDotUI ? "translateY(0)" : "translateY(110%)",
+          transition: "transform 0.3s cubic-bezier(0.16, 1, 0.3, 1)",
+          pointerEvents: selectedDotUI ? "auto" : "none",
         }}
       >
-        {activeDotUI && (
-          <div
-            style={{
-              display: "flex",
-              flexWrap: "wrap",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: "12px",
-            }}
-          >
-            {/* Header: Symbol, Name, State Badge */}
+        {selectedDotUI && (
+          <>
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-              <span style={{ fontSize: "28px", lineHeight: "28px" }}>{activeDotUI.symbol}</span>
+              <span style={{ fontSize: "24px" }}>{selectedDotUI.symbol}</span>
               <div>
-                <h4 style={{ margin: 0, fontSize: "16px", color: "#111" }}>{activeDotUI.name}</h4>
+                <b style={{ fontSize: "14px", display: "block", color: "#222" }}>
+                  {selectedDotUI.name}
+                </b>
                 <span
                   style={{
                     display: "inline-block",
-                    marginTop: "3px",
                     padding: "2px 8px",
                     borderRadius: "10px",
-                    fontSize: "11px",
+                    fontSize: "10px",
                     fontWeight: "bold",
                     color: "#fff",
-                    backgroundColor: getStateColor(activeDotUI.state),
+                    background: STATE_COLORS[selectedDotUI.state] || "#757575",
                   }}
                 >
-                  {activeDotUI.state}
+                  {selectedDotUI.state}
                 </span>
               </div>
             </div>
 
-            {/* Metrics Row */}
-            <div
-              style={{
-                display: "flex",
-                flexWrap: "wrap",
-                alignItems: "center",
-                gap: "14px",
-                fontSize: "12px",
-                color: "#333",
-              }}
-            >
-              <div>
-                <span style={{ fontSize: "10px", color: "#777", display: "block" }}>ETA</span>
-                <b>{activeDotUI.eta}</b>
+            <div style={{ display: "flex", gap: "14px", alignItems: "center" }}>
+              <div style={{ fontSize: "12px", color: "#333" }}>
+                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>ETA</span>
+                <b>{selectedDotUI.eta}</b>
               </div>
-              <div>
-                <span style={{ fontSize: "10px", color: "#777", display: "block" }}>Time Left</span>
-                <b>{activeDotUI.timeLeft}</b>
+              <div style={{ fontSize: "12px", color: "#333" }}>
+                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Time Left</span>
+                <b>{selectedDotUI.timeLeft}</b>
               </div>
-              <div>
-                <span style={{ fontSize: "10px", color: "#777", display: "block" }}>Distance</span>
-                <b>{activeDotUI.distLeft}</b>
+              <div style={{ fontSize: "12px", color: "#333" }}>
+                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Distance</span>
+                <b>{selectedDotUI.distLeft}</b>
               </div>
-              <div>
-                <span style={{ fontSize: "10px", color: "#777", display: "block" }}>Speed</span>
-                <b>{activeDotUI.speed.toFixed(1)} m/s</b>
+              <div style={{ fontSize: "12px", color: "#333" }}>
+                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Speed</span>
+                <b>{selectedDotUI.speed} m/s</b>
               </div>
-              <div>
-                <span style={{ fontSize: "10px", color: "#777", display: "block" }}>Radius</span>
-                <b>{activeDotUI.radius} m</b>
+              <div style={{ fontSize: "12px", color: "#333" }}>
+                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Radius</span>
+                <b>{selectedDotUI.radius} m</b>
+              </div>
+              <div style={{ fontSize: "12px", color: "#333" }}>
+                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Sight</span>
+                <b>{selectedDotUI.sight} m</b>
               </div>
             </div>
 
-            {/* Actions: +5ms⁻¹, +10m, TP, Hide */}
-            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
               <button
-                onClick={(e) => handleAddSpeed(activeDotUI.id, e)}
+                onClick={(e) => handleAddSpeed(selectedDotUI.id, e)}
                 style={{
-                  padding: "6px 12px",
+                  padding: "5px 10px",
                   background: "#0d6efd",
                   color: "#fff",
                   border: "none",
-                  borderRadius: "16px",
+                  borderRadius: "14px",
                   fontSize: "11px",
                   fontWeight: "bold",
                   cursor: "pointer",
@@ -728,15 +1083,14 @@ export default function App() {
               >
                 +5ms⁻¹
               </button>
-
               <button
-                onClick={(e) => handleAddRadius(activeDotUI.id, e)}
+                onClick={(e) => handleAddRadius(selectedDotUI.id, e)}
                 style={{
-                  padding: "6px 12px",
+                  padding: "5px 10px",
                   background: "#0dcaf0",
                   color: "#000",
                   border: "none",
-                  borderRadius: "16px",
+                  borderRadius: "14px",
                   fontSize: "11px",
                   fontWeight: "bold",
                   cursor: "pointer",
@@ -744,15 +1098,29 @@ export default function App() {
               >
                 +10m
               </button>
-
               <button
-                onClick={(e) => handleTeleport(activeDotUI.id, e)}
+                onClick={(e) => handleAddSight(selectedDotUI.id, e)}
                 style={{
-                  padding: "6px 12px",
+                  padding: "5px 10px",
+                  background: "#ffc107",
+                  color: "#000",
+                  border: "none",
+                  borderRadius: "14px",
+                  fontSize: "11px",
+                  fontWeight: "bold",
+                  cursor: "pointer",
+                }}
+              >
+                +50m
+              </button>
+              <button
+                onClick={(e) => handleTeleport(selectedDotUI.id, e)}
+                style={{
+                  padding: "5px 10px",
                   background: "#6f42c1",
                   color: "#fff",
                   border: "none",
-                  borderRadius: "16px",
+                  borderRadius: "14px",
                   fontSize: "11px",
                   fontWeight: "bold",
                   cursor: "pointer",
@@ -760,28 +1128,26 @@ export default function App() {
               >
                 TP
               </button>
-
               <button
-                onClick={handleDeselect}
+                onClick={() => handleToggleSelect(selectedDotUI.id)}
                 style={{
-                  padding: "6px 14px",
-                  background: "#f1f3f5",
-                  color: "#495057",
-                  border: "1px solid #ced4da",
-                  borderRadius: "16px",
+                  padding: "5px 12px",
+                  background: "#e0e0e0",
+                  color: "#333",
+                  border: "none",
+                  borderRadius: "14px",
                   fontSize: "11px",
                   fontWeight: "bold",
                   cursor: "pointer",
                 }}
               >
-                Hide
+                ✕ Hide
               </button>
             </div>
-          </div>
+          </>
         )}
       </div>
 
-      {/* Leaflet Fullscreen Container */}
       <div ref={mapContainerRef} style={{ width: "100%", height: "100%" }} />
     </div>
   );
