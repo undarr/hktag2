@@ -309,7 +309,7 @@ export default function App() {
       map.getPane("fogPane").style.zIndex = 400;
 
       // Broad padding (0.8) so chunk updates happen far outside view
-      const fogRenderer = L.canvas({ pane: "fogPane", padding: 0.8 });
+      const fogRenderer = L.canvas({ pane: "fogPane", padding: 0.1 });
       fogRenderer.addTo(map);
       fogRendererRef.current = fogRenderer;
 
