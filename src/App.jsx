@@ -11,8 +11,6 @@ const DOT_CONFIGS = [
   { id: 3, symbol: "🏃", name: "Runner" },
 ];
 
-const WINE_RED = "#800020";
-
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000.0;
   const dLat = (lat2 - lat1) * (Math.PI / 180);
@@ -24,93 +22,72 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Intense, vibrant glow colors corresponding to the old borders
-function getGlowColor(isSelected, state) {
-  if (isSelected) return "#ffe600"; // Vibrant Electric Yellow
-  switch (state) {
-    case "Move":
-      return "#00e676"; // Vibrant Jungle Green
-    case "Ferry":
-      return "#00b0ff"; // Vibrant Ocean Blue
-    case "Redirecting":
-      return "#ff9100"; // Vibrant Orange
-    case "Stop":
-    default:
-      return "#9e9e9e"; // Grey
-  }
-}
+// Updated Glowing Icon Generator
+function createDotIcon(symbol, color, isStrongGlow) {
+  const filter = isStrongGlow
+    ? `drop-shadow(0 0 3px ${color}) drop-shadow(0 0 4px ${color}) drop-shadow(0 0 8px ${color})`
+    : `drop-shadow(0 0 3px ${color}) drop-shadow(0 0 8px ${color})`;
 
-// Zoom < 17: Circle has a wine red border and an intense multi-layered glow
-function createCircleIcon(glowColor) {
   return L.divIcon({
-    className: "dot-circle-icon",
-    html: `<div style="
-      width: 20px;
-      height: 20px;
-      border-radius: 50%;
-      background-color: #ff0000;
-      border: 1px solid ${WINE_RED};
-      box-shadow: 0 0 6px 2px ${glowColor}, 0 0 14px 5px ${glowColor}, 0 0 24px 8px ${glowColor};
-      box-sizing: border-box;
-    "></div>`,
+    className: "dot-emoji-icon",
+    html: `<div style="font-size: ${isStrongGlow ? "20px" : "18px"}; line-height: 18px; text-align: center; user-select: none; cursor: pointer; filter: ${filter}; transform: ${isStrongGlow ? "scale(1.2)" : "scale(1)"}; transition: transform 0.2s ease;">${symbol}</div>`,
     iconSize: [20, 20],
     iconAnchor: [10, 10],
   });
 }
 
-// Zoom >= 17: Emoji has an intense multi-layered drop shadow glow
-function createEmojiIcon(symbol, glowColor = null) {
-  const glowStyle = glowColor
-    ? `filter: drop-shadow(0 0 3px ${glowColor}) drop-shadow(0 0 8px ${glowColor}) drop-shadow(0 0 15px ${glowColor});`
-    : "";
-
-  return L.divIcon({
-    className: "dot-emoji-icon",
-    html: `<div style="
-      font-size: 15px;
-      line-height: 15px;
-      text-align: center;
-      user-select: none;
-      ${glowStyle}
-    ">${symbol}</div>`,
-    iconSize: [16, 16],
-    iconAnchor: [8, 8],
-  });
+function getStateColor(state) {
+  switch (state) {
+    case "Move":
+      return "#2e7d32";
+    case "Ferry":
+      return "#0288d1";
+    case "Redirecting":
+      return "#ed6c02";
+    default:
+      return "#757575";
+  }
 }
 
-// Splits remaining waypoints into land (green) and water (blue) multi-polylines
-function computeRemainingPathSegments(dot) {
+// Split waypoints into land (jungle green) and water (ocean blue) segments
+function buildPathSegments(dot) {
   const { pos, waypoints, waterFlags, segIdx } = dot;
-  if (!waypoints || waypoints.length < 2 || segIdx >= waypoints.length - 1) {
-    return { land: [], water: [] };
+  if (!waypoints || waypoints.length <= 1 || segIdx >= waypoints.length - 1) {
+    return { landMulti: [], waterMulti: [] };
   }
 
-  const land = [];
-  const water = [];
+  const landMulti = [];
+  const waterMulti = [];
 
-  let curType = waterFlags[segIdx];
-  let curPoints = [pos, waypoints[segIdx + 1]];
+  let currentType = waterFlags[segIdx] === 1 ? "water" : "land";
+  let currentChunk = [pos, waypoints[segIdx + 1]];
 
   for (let i = segIdx + 1; i < waypoints.length - 1; i++) {
-    const flag = waterFlags[i];
+    const segType = waterFlags[i] === 1 ? "water" : "land";
     const nextPt = waypoints[i + 1];
-    if (flag === curType) {
-      curPoints.push(nextPt);
-    } else {
-      if (curType === 1) water.push(curPoints);
-      else land.push(curPoints);
 
-      curType = flag;
-      curPoints = [waypoints[i], nextPt];
+    if (segType === currentType) {
+      currentChunk.push(nextPt);
+    } else {
+      if (currentType === "water") {
+        waterMulti.push(currentChunk);
+      } else {
+        landMulti.push(currentChunk);
+      }
+      currentType = segType;
+      currentChunk = [waypoints[i], nextPt];
     }
   }
 
-  if (curPoints.length > 1) {
-    if (curType === 1) water.push(curPoints);
-    else land.push(curPoints);
+  if (currentChunk.length > 1) {
+    if (currentType === "water") {
+      waterMulti.push(currentChunk);
+    } else {
+      landMulti.push(currentChunk);
+    }
   }
 
-  return { land, water };
+  return { landMulti, waterMulti };
 }
 
 export default function App() {
@@ -118,10 +95,10 @@ export default function App() {
   const mapRef = useRef(null);
   const defaultBboxRef = useRef(null);
 
-  // Mobile pinch/zoom tracking ref
+  // Mobile pinch-zoom guard
   const isZoomingRef = useRef(false);
 
-  // Selected Bubble State
+  // Selected State
   const [selectedId, setSelectedId] = useState(null);
   const selectedIdRef = useRef(null);
 
@@ -130,19 +107,22 @@ export default function App() {
     DOT_CONFIGS.map((cfg) => ({
       id: cfg.id,
       symbol: cfg.symbol,
+      name: cfg.name,
       state: "Stop",
       eta: "--",
       timeLeft: "--",
+      distLeft: "--",
       speed: 20.0,
       radius: 25,
     }))
   );
 
-  // Engine state for all 4 dots
+  // Engine state kept in refs for high-speed simulation
   const dotsRef = useRef(
     DOT_CONFIGS.map((cfg) => ({
       id: cfg.id,
       symbol: cfg.symbol,
+      name: cfg.name,
       pos: [22.3193, 114.1694],
       state: "Stop",
       speed: 20.0,
@@ -150,13 +130,12 @@ export default function App() {
       waypoints: [],
       waterFlags: [],
       segIdx: 0,
+      distLeft: "--",
       nextAllowedClick: 0,
       redirectStart: 0,
       ferryTarget: null,
-      lastVisualKey: null,
       layers: {
         dotOuter: null,
-        dotCircle: null,
         dotEmoji: null,
         landPath: null,
         waterPath: null,
@@ -165,40 +144,11 @@ export default function App() {
     }))
   );
 
-  // Updates visual icons/glow only when zoom threshold or state/selection changes
-  const refreshDotVisuals = (dot, currentZoom, isSelected) => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    const glowColor = getGlowColor(isSelected, dot.state);
-    const isUnder17 = currentZoom < 17;
-    const visualKey = `${isUnder17 ? "circle" : "emoji"}-${glowColor}`;
-
-    if (dot.lastVisualKey === visualKey) return;
-    dot.lastVisualKey = visualKey;
-
-    if (isUnder17) {
-      // Zoom < 17: show circle with wine red border and glow; emoji sits plain on top
-      if (!map.hasLayer(dot.layers.dotCircle)) {
-        dot.layers.dotCircle.addTo(map);
-      }
-      dot.layers.dotCircle.setIcon(createCircleIcon(glowColor));
-      dot.layers.dotEmoji.setIcon(createEmojiIcon(dot.symbol, null));
-    } else {
-      // Zoom >= 17: remove red circle; emoji emits significant glow
-      if (map.hasLayer(dot.layers.dotCircle)) {
-        dot.layers.dotCircle.remove();
-      }
-      dot.layers.dotEmoji.setIcon(createEmojiIcon(dot.symbol, glowColor));
-    }
-  };
-
-  // 1. Initialize Map and the 4 Dots
+  // 1. Initialize Map and Dots
   useEffect(() => {
     if (!mapRef.current) {
-      // 1. MinZoom is 11, maxZoom constraint removed
       const map = L.map(mapContainerRef.current, {
-        minZoom: 11,
+        minZoom: 10,
         zoomAnimation: true,
         zoomAnimationDuration: 0.15,
         wheelDebounceTime: 15,
@@ -206,7 +156,7 @@ export default function App() {
       }).setView([22.3193, 114.1694], 12);
 
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        minZoom: 11,
+        minZoom: 10,
         maxZoom: 19,
         attribution: "© OpenStreetMap",
       }).addTo(map);
@@ -214,7 +164,6 @@ export default function App() {
       const vectorRenderer = L.svg({ padding: 0.5 });
 
       dotsRef.current.forEach((dot) => {
-        // Outer 25m transparent red disk
         const dotOuter = L.circle(dot.pos, {
           renderer: vectorRenderer,
           radius: dot.radius,
@@ -224,37 +173,30 @@ export default function App() {
           fillOpacity: 0.25,
         }).addTo(map);
 
-        // 2 & 3. Red Circle with Wine Red Border + Glow (zIndexOffset: 500)
-        const dotCircle = L.marker(dot.pos, {
-          icon: createCircleIcon(getGlowColor(false, dot.state)),
-          zIndexOffset: 500,
-          interactive: false,
+        const dotEmoji = L.marker(dot.pos, {
+          icon: createDotIcon(dot.symbol, "#ff0000", false),
+          interactive: true,
+        }).addTo(map);
+
+        dotEmoji.on("click", (e) => {
+          L.DomEvent.stopPropagation(e);
+          handleToggleSelect(dot.id);
         });
 
-        // 2 & 3. Emoji Marker with higher zIndex (zIndexOffset: 1000)
-        const dotEmoji = L.marker(dot.pos, {
-          icon: createEmojiIcon(dot.symbol, null),
-          zIndexOffset: 1000,
-          interactive: false,
-        }).addTo(map);
-
-        // Land path: transparent jungle green (#2e7d32)
         const landPath = L.polyline([], {
           renderer: vectorRenderer,
-          color: "#2e7d32",
+          color: "#1e824c",
           weight: 5,
-          opacity: 0.45,
+          opacity: 0.55,
         }).addTo(map);
 
-        // Water path: transparent ocean blue (#0288d1)
         const waterPath = L.polyline([], {
           renderer: vectorRenderer,
-          color: "#0288d1",
+          color: "#0077be",
           weight: 5,
-          opacity: 0.45,
+          opacity: 0.55,
         }).addTo(map);
 
-        // Dashed hollow destination circle
         const hollowDest = L.circle([0, 0], {
           renderer: vectorRenderer,
           radius: 15,
@@ -264,45 +206,27 @@ export default function App() {
           fill: false,
         }).addTo(map);
 
-        dot.layers = {
-          dotOuter,
-          dotCircle,
-          dotEmoji,
-          landPath,
-          waterPath,
-          hollowDest,
-        };
+        dot.layers = { dotOuter, dotEmoji, landPath, waterPath, hollowDest };
       });
 
-      // Initialize icon visuals
-      const curZoom = map.getZoom();
-      dotsRef.current.forEach((dot) => refreshDotVisuals(dot, curZoom, false));
-
-      // Mobile Touch & Zoom Guards
       map.on("zoomstart", () => {
         isZoomingRef.current = true;
       });
 
       map.on("zoomend", () => {
         isZoomingRef.current = false;
-        const z = map.getZoom();
-
         dotsRef.current.forEach((dot) => {
-          refreshDotVisuals(dot, z, selectedIdRef.current === dot.id);
-
           dot.layers.dotOuter.setLatLng(dot.pos);
-          if (dot.layers.dotCircle) dot.layers.dotCircle.setLatLng(dot.pos);
           dot.layers.dotEmoji.setLatLng(dot.pos);
 
-          const { land, water } = computeRemainingPathSegments(dot);
-          dot.layers.landPath.setLatLngs(land);
-          dot.layers.waterPath.setLatLngs(water);
+          const { landMulti, waterMulti } = buildPathSegments(dot);
+          dot.layers.landPath.setLatLngs(landMulti);
+          dot.layers.waterPath.setLatLngs(waterMulti);
         });
       });
 
       mapRef.current = map;
 
-      // Load graph & scatter dots across 4 random land nodes
       initGraph()
         .then(async ({ bbox }) => {
           defaultBboxRef.current = bbox;
@@ -316,17 +240,14 @@ export default function App() {
             const dot = dotsRef.current[i];
             dot.pos = initialSnap.pt;
             dot.layers.dotOuter.setLatLng(initialSnap.pt);
-            if (dot.layers.dotCircle) dot.layers.dotCircle.setLatLng(initialSnap.pt);
             dot.layers.dotEmoji.setLatLng(initialSnap.pt);
           }
-          const zNow = map.getZoom();
-          dotsRef.current.forEach((dot) => refreshDotVisuals(dot, zNow, selectedIdRef.current === dot.id));
         })
         .catch((err) => console.error("Init Error:", err));
     }
   }, []);
 
-  // 2. High-Performance Movement Engine for All 4 Dots (60 FPS)
+  // 2. High-Performance Movement Engine (60 FPS)
   useEffect(() => {
     let animId;
     let lastTime = performance.now();
@@ -340,8 +261,6 @@ export default function App() {
       const isZooming =
         isZoomingRef.current ||
         Boolean(map && (map._animatingZoom || map._zooming || (map.touchZoom && map.touchZoom._zooming)));
-
-      const currentZoom = map ? map.getZoom() : 12;
 
       dotsRef.current.forEach((dot) => {
         const { state, waypoints, layers } = dot;
@@ -385,12 +304,11 @@ export default function App() {
 
           if (!isZooming) {
             layers.dotOuter.setLatLng(dot.pos);
-            if (layers.dotCircle) layers.dotCircle.setLatLng(dot.pos);
             layers.dotEmoji.setLatLng(dot.pos);
 
-            const { land, water } = computeRemainingPathSegments(dot);
-            layers.landPath.setLatLngs(land);
-            layers.waterPath.setLatLngs(water);
+            const { landMulti, waterMulti } = buildPathSegments(dot);
+            layers.landPath.setLatLngs(landMulti);
+            layers.waterPath.setLatLngs(waterMulti);
           }
 
           if (state !== "Redirecting") {
@@ -405,6 +323,7 @@ export default function App() {
             layers.waterPath.setLatLngs([]);
             dot.timeLeft = "--";
             dot.eta = "--";
+            dot.distLeft = "--";
           } else {
             let remDist = haversineMeters(dot.pos[0], dot.pos[1], waypoints[segIdx + 1][0], waypoints[segIdx + 1][1]);
             for (let i = segIdx + 1; i < waypoints.length - 1; i++) {
@@ -412,25 +331,23 @@ export default function App() {
             }
             const remSec = remDist / dot.speed;
             dot.timeLeft = remSec.toFixed(1) + "s";
+            dot.distLeft = remDist > 1000 ? (remDist / 1000).toFixed(2) + " km" : Math.round(remDist) + " m";
             const etaDate = new Date(Date.now() + remSec * 1000);
             dot.eta = etaDate.toLocaleTimeString([], { hour12: false });
           }
         }
-
-        // Dynamically update visuals when state or zoom changes
-        const isSelected = selectedIdRef.current === dot.id;
-        refreshDotVisuals(dot, currentZoom, isSelected);
       });
 
-      // Synchronize UI every 100ms
       if (now - lastUIUpdate > 100) {
         setDotsUI(
           dotsRef.current.map((d) => ({
             id: d.id,
             symbol: d.symbol,
+            name: d.name,
             state: d.state,
             eta: d.eta,
             timeLeft: d.timeLeft,
+            distLeft: d.distLeft,
             speed: d.speed,
             radius: d.radius,
           }))
@@ -445,29 +362,39 @@ export default function App() {
     return () => cancelAnimationFrame(animId);
   }, []);
 
-  // 3. Selection & Camera Panning Logic
+  // 3. Selection & Animation Logic
   const handleToggleSelect = (id) => {
     const map = mapRef.current;
     if (!map) return;
 
-    const nextSelectedId = selectedIdRef.current === id ? null : id;
-    selectedIdRef.current = nextSelectedId;
-    setSelectedId(nextSelectedId);
+    let nextSelectedId = null;
 
-    const currentZoom = map.getZoom();
-    dotsRef.current.forEach((dot) => {
-      refreshDotVisuals(dot, currentZoom, dot.id === nextSelectedId);
-    });
-
-    if (nextSelectedId === null) {
+    if (selectedIdRef.current === id) {
+      selectedIdRef.current = null;
+      setSelectedId(null);
       if (defaultBboxRef.current) {
         map.fitBounds(defaultBboxRef.current, { animate: true, duration: 0.7 });
       }
     } else {
-      const dot = dotsRef.current[nextSelectedId];
+      nextSelectedId = id;
+      selectedIdRef.current = id;
+      setSelectedId(id);
+      const dot = dotsRef.current[id];
       if (dot) {
         map.panTo(dot.pos, { animate: true, duration: 0.6 });
       }
+    }
+
+    dotsRef.current.forEach((d) => {
+      if (d.layers.dotEmoji) {
+        d.layers.dotEmoji.setIcon(createDotIcon(d.symbol, "#ff0000", d.id === nextSelectedId));
+      }
+    });
+  };
+
+  const handleDeselect = () => {
+    if (selectedIdRef.current !== null) {
+      handleToggleSelect(selectedIdRef.current);
     }
   };
 
@@ -492,7 +419,6 @@ export default function App() {
 
       dot.redirectStart = performance.now();
 
-      // Scenario A: Selected dot is on Ferry
       if (curState === "Ferry") {
         let bIdx = waypoints.length - 1;
         for (let i = curSeg; i < flags.length; i++) {
@@ -537,15 +463,13 @@ export default function App() {
         dot.pos = newWaypoints[0];
         dot.ferryTarget = null;
 
-        const { land, water } = computeRemainingPathSegments(dot);
-        dot.layers.landPath.setLatLngs(land);
-        dot.layers.waterPath.setLatLngs(water);
+        const { landMulti, waterMulti } = buildPathSegments(dot);
+        dot.layers.landPath.setLatLngs(landMulti);
+        dot.layers.waterPath.setLatLngs(waterMulti);
 
         dot.nextAllowedClick = performance.now() + 200;
         dot.state = newFlags[0] === 1 ? "Ferry" : "Move";
-      }
-      // Scenario B: Selected dot is in Move or Stop
-      else {
+      } else {
         dot.state = "Redirecting";
 
         const startPos = dot.pos;
@@ -566,12 +490,11 @@ export default function App() {
         dot.pos = newWaypoints[0];
 
         dot.layers.dotOuter.setLatLng(dot.pos);
-        if (dot.layers.dotCircle) dot.layers.dotCircle.setLatLng(dot.pos);
         dot.layers.dotEmoji.setLatLng(dot.pos);
 
-        const { land, water } = computeRemainingPathSegments(dot);
-        dot.layers.landPath.setLatLngs(land);
-        dot.layers.waterPath.setLatLngs(water);
+        const { landMulti, waterMulti } = buildPathSegments(dot);
+        dot.layers.landPath.setLatLngs(landMulti);
+        dot.layers.waterPath.setLatLngs(waterMulti);
 
         dot.nextAllowedClick = performance.now() + 200;
         dot.state = waterFlags[0] === 1 ? "Ferry" : "Move";
@@ -583,22 +506,22 @@ export default function App() {
     return () => map.off("click", onMapClick);
   }, []);
 
-  // BUTTON HANDLERS
+  // --- CONTROL BUTTON HANDLERS ---
   const handleAddSpeed = (id, e) => {
-    e.stopPropagation();
+    e?.stopPropagation();
     const dot = dotsRef.current[id];
     dot.speed += 5.0;
   };
 
   const handleAddRadius = (id, e) => {
-    e.stopPropagation();
+    e?.stopPropagation();
     const dot = dotsRef.current[id];
     dot.radius += 10;
     if (dot.layers.dotOuter) dot.layers.dotOuter.setRadius(dot.radius);
   };
 
   const handleTeleport = (id, e) => {
-    e.stopPropagation();
+    e?.stopPropagation();
     const dot = dotsRef.current[id];
     if (!dot.waypoints || dot.waypoints.length === 0) return;
 
@@ -606,7 +529,6 @@ export default function App() {
     dot.pos = destCoord;
 
     if (dot.layers.dotOuter) dot.layers.dotOuter.setLatLng(destCoord);
-    if (dot.layers.dotCircle) dot.layers.dotCircle.setLatLng(destCoord);
     if (dot.layers.dotEmoji) dot.layers.dotEmoji.setLatLng(destCoord);
     if (dot.layers.landPath) dot.layers.landPath.setLatLngs([]);
     if (dot.layers.waterPath) dot.layers.waterPath.setLatLngs([]);
@@ -618,168 +540,249 @@ export default function App() {
     dot.state = "Stop";
     dot.timeLeft = "--";
     dot.eta = "--";
+    dot.distLeft = "--";
+  };
+
+  // Currently selected dot for the popup
+  const activeDotUI = dotsUI.find((d) => d.id === selectedId) || null;
+
+  // Render button for an agent
+  const renderCircleButton = (dot) => {
+    const isSelected = selectedId === dot.id;
+    const isMoving = dot.state !== "Stop";
+    const stateColor = getStateColor(dot.state);
+
+    return (
+      <button
+        key={dot.id}
+        onClick={() => handleToggleSelect(dot.id)}
+        style={{
+          width: "54px",
+          height: "54px",
+          borderRadius: "50%",
+          backgroundColor: isSelected ? "#fff9c4" : "#ffffff", // tints yellow when selected
+          border: isMoving ? `3.5px solid ${stateColor}` : "none", // border only when moving
+          boxShadow: isSelected
+            ? "0 4px 18px rgba(255, 214, 0, 0.65), 0 2px 8px rgba(0,0,0,0.25)"
+            : "0 3px 12px rgba(0, 0, 0, 0.2)",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontSize: "24px",
+          outline: "none",
+          transition: "all 0.25s ease",
+          userSelect: "none",
+        }}
+      >
+        {dot.symbol}
+      </button>
+    );
   };
 
   return (
-    <>
-      {/* Global CSS Reset removing the 8px user-agent margin */}
-      <style>{`
-        html, body {
-          margin: 0 !important;
-          padding: 0 !important;
-          width: 100%;
-          height: 100%;
-          overflow: hidden;
-        }
-        * {
-          box-sizing: border-box;
-        }
-      `}</style>
-
+    <div
+      style={{
+        position: "fixed",
+        top: 0,
+        left: 0,
+        width: "100vw",
+        height: "100vh",
+        margin: 0,
+        padding: 0,
+        overflow: "hidden",
+      }}
+    >
+      {/* 2 Circle Buttons on Left Side */}
       <div
         style={{
-          position: "relative",
-          width: "100vw",
-          height: "100vh",
-          margin: 0,
-          padding: 0,
-          overflow: "hidden",
+          position: "absolute",
+          left: 20,
+          top: "50%",
+          transform: "translateY(-50%)",
+          zIndex: 1000,
+          display: "flex",
+          flexDirection: "column",
+          gap: "18px",
         }}
       >
-        {/* Top-Left 4 Fat Bubbles Modal */}
-        <div
-          style={{
-            position: "absolute",
-            top: 15,
-            left: 60,
-            zIndex: 1000,
-            display: "flex",
-            flexDirection: "column",
-            gap: "8px",
-            fontFamily: "system-ui, -apple-system, sans-serif",
-            pointerEvents: "auto",
-          }}
-        >
-          {dotsUI.map((dot) => {
-            const isSelected = selectedId === dot.id;
+        {dotsUI.slice(0, 2).map((dot) => renderCircleButton(dot))}
+      </div>
 
-            return (
-              <div
-                key={dot.id}
-                onClick={() => handleToggleSelect(dot.id)}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "10px",
-                  padding: "8px 16px",
-                  borderRadius: "32px",
-                  background: isSelected ? "#e8f5e9" : "rgba(255, 255, 255, 0.95)",
-                  border: isSelected ? "2.5px solid #2e7d32" : "1.5px solid #e0e0e0",
-                  boxShadow: isSelected
-                    ? "0 4px 14px rgba(46, 125, 50, 0.35)"
-                    : "0 2px 10px rgba(0, 0, 0, 0.15)",
-                  cursor: "pointer",
-                  transition: "all 0.2s ease-in-out",
-                  userSelect: "none",
-                }}
-              >
-                {/* Symbol */}
-                <span style={{ fontSize: "22px", display: "flex", alignItems: "center" }}>
-                  {dot.symbol}
-                </span>
+      {/* 2 Circle Buttons on Right Side */}
+      <div
+        style={{
+          position: "absolute",
+          right: 20,
+          top: "50%",
+          transform: "translateY(-50%)",
+          zIndex: 1000,
+          display: "flex",
+          flexDirection: "column",
+          gap: "18px",
+        }}
+      >
+        {dotsUI.slice(2, 4).map((dot) => renderCircleButton(dot))}
+      </div>
 
-                {/* State Badge */}
+      {/* 70% Width Slide-Up Popup Modal */}
+      <div
+        style={{
+          position: "absolute",
+          bottom: 24,
+          left: "50%",
+          width: "70%",
+          maxWidth: "880px",
+          zIndex: 1001,
+          transform: selectedId !== null ? "translateX(-50%) translateY(0%)" : "translateX(-50%) translateY(140%)",
+          transition: "transform 0.35s cubic-bezier(0.2, 0.9, 0.3, 1)",
+          pointerEvents: selectedId !== null ? "auto" : "none",
+          backgroundColor: "rgba(255, 255, 255, 0.96)",
+          backdropFilter: "blur(12px)",
+          borderRadius: "24px",
+          boxShadow: "0 14px 38px rgba(0, 0, 0, 0.25)",
+          padding: "16px 24px",
+          fontFamily: "system-ui, -apple-system, sans-serif",
+          boxSizing: "border-box",
+        }}
+      >
+        {activeDotUI && (
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "12px",
+            }}
+          >
+            {/* Header: Symbol, Name, State Badge */}
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <span style={{ fontSize: "28px", lineHeight: "28px" }}>{activeDotUI.symbol}</span>
+              <div>
+                <h4 style={{ margin: 0, fontSize: "16px", color: "#111" }}>{activeDotUI.name}</h4>
                 <span
                   style={{
-                    padding: "3px 9px",
-                    borderRadius: "12px",
+                    display: "inline-block",
+                    marginTop: "3px",
+                    padding: "2px 8px",
+                    borderRadius: "10px",
                     fontSize: "11px",
                     fontWeight: "bold",
                     color: "#fff",
-                    minWidth: "48px",
-                    textAlign: "center",
-                    background:
-                      dot.state === "Move"
-                        ? "#2e7d32"
-                        : dot.state === "Ferry"
-                        ? "#0288d1"
-                        : dot.state === "Redirecting"
-                        ? "#ed6c02"
-                        : "#757575",
+                    backgroundColor: getStateColor(activeDotUI.state),
                   }}
                 >
-                  {dot.state}
+                  {activeDotUI.state}
                 </span>
-
-                {/* ETA */}
-                <div style={{ fontSize: "12px", color: "#333", minWidth: "65px" }}>
-                  <span style={{ fontSize: "10px", color: "#888", display: "block" }}>ETA</span>
-                  <b>{dot.eta}</b>
-                </div>
-
-                {/* Time Left */}
-                <div style={{ fontSize: "12px", color: "#333", minWidth: "55px" }}>
-                  <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Time Left</span>
-                  <b>{dot.timeLeft}</b>
-                </div>
-
-                {/* +5ms^-1 Button */}
-                <button
-                  onClick={(e) => handleAddSpeed(dot.id, e)}
-                  style={{
-                    padding: "5px 10px",
-                    background: "#0d6efd",
-                    color: "#fff",
-                    border: "none",
-                    borderRadius: "16px",
-                    fontSize: "11px",
-                    fontWeight: "bold",
-                    cursor: "pointer",
-                  }}
-                >
-                  +5ms⁻¹
-                </button>
-
-                {/* +10m Button */}
-                <button
-                  onClick={(e) => handleAddRadius(dot.id, e)}
-                  style={{
-                    padding: "5px 10px",
-                    background: "#0dcaf0",
-                    color: "#000",
-                    border: "none",
-                    borderRadius: "16px",
-                    fontSize: "11px",
-                    fontWeight: "bold",
-                    cursor: "pointer",
-                  }}
-                >
-                  +10m
-                </button>
-
-                {/* TP Button */}
-                <button
-                  onClick={(e) => handleTeleport(dot.id, e)}
-                  style={{
-                    padding: "5px 10px",
-                    background: "#6f42c1",
-                    color: "#fff",
-                    border: "none",
-                    borderRadius: "16px",
-                    fontSize: "11px",
-                    fontWeight: "bold",
-                    cursor: "pointer",
-                  }}
-                >
-                  TP
-                </button>
               </div>
-            );
-          })}
-        </div>
+            </div>
 
-        <div ref={mapContainerRef} style={{ width: "100%", height: "100%" }} />
+            {/* Metrics Row */}
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                alignItems: "center",
+                gap: "14px",
+                fontSize: "12px",
+                color: "#333",
+              }}
+            >
+              <div>
+                <span style={{ fontSize: "10px", color: "#777", display: "block" }}>ETA</span>
+                <b>{activeDotUI.eta}</b>
+              </div>
+              <div>
+                <span style={{ fontSize: "10px", color: "#777", display: "block" }}>Time Left</span>
+                <b>{activeDotUI.timeLeft}</b>
+              </div>
+              <div>
+                <span style={{ fontSize: "10px", color: "#777", display: "block" }}>Distance</span>
+                <b>{activeDotUI.distLeft}</b>
+              </div>
+              <div>
+                <span style={{ fontSize: "10px", color: "#777", display: "block" }}>Speed</span>
+                <b>{activeDotUI.speed.toFixed(1)} m/s</b>
+              </div>
+              <div>
+                <span style={{ fontSize: "10px", color: "#777", display: "block" }}>Radius</span>
+                <b>{activeDotUI.radius} m</b>
+              </div>
+            </div>
+
+            {/* Actions: +5ms⁻¹, +10m, TP, Hide */}
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <button
+                onClick={(e) => handleAddSpeed(activeDotUI.id, e)}
+                style={{
+                  padding: "6px 12px",
+                  background: "#0d6efd",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: "16px",
+                  fontSize: "11px",
+                  fontWeight: "bold",
+                  cursor: "pointer",
+                }}
+              >
+                +5ms⁻¹
+              </button>
+
+              <button
+                onClick={(e) => handleAddRadius(activeDotUI.id, e)}
+                style={{
+                  padding: "6px 12px",
+                  background: "#0dcaf0",
+                  color: "#000",
+                  border: "none",
+                  borderRadius: "16px",
+                  fontSize: "11px",
+                  fontWeight: "bold",
+                  cursor: "pointer",
+                }}
+              >
+                +10m
+              </button>
+
+              <button
+                onClick={(e) => handleTeleport(activeDotUI.id, e)}
+                style={{
+                  padding: "6px 12px",
+                  background: "#6f42c1",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: "16px",
+                  fontSize: "11px",
+                  fontWeight: "bold",
+                  cursor: "pointer",
+                }}
+              >
+                TP
+              </button>
+
+              <button
+                onClick={handleDeselect}
+                style={{
+                  padding: "6px 14px",
+                  background: "#f1f3f5",
+                  color: "#495057",
+                  border: "1px solid #ced4da",
+                  borderRadius: "16px",
+                  fontSize: "11px",
+                  fontWeight: "bold",
+                  cursor: "pointer",
+                }}
+              >
+                Hide
+              </button>
+            </div>
+          </div>
+        )}
       </div>
-    </>
+
+      {/* Leaflet Fullscreen Container */}
+      <div ref={mapContainerRef} style={{ width: "100%", height: "100%" }} />
+    </div>
   );
 }
