@@ -163,7 +163,6 @@ export default function App() {
       nextAllowedClick: 0,
       redirectStart: 0,
       ferryTarget: null,
-      targetDest: null,
       distLeft: "--",
       layers: {
         dotEmoji: null,
@@ -171,7 +170,7 @@ export default function App() {
     }))
   );
 
-  // 1. Draw Paths & Unit Ground Circles onto Screen Canvas (zIndex: 420)
+  // 1. Draw Paths, Hollow Destination, & Unit Ground Circles onto Screen Canvas (zIndex: 420)
   const drawDynamicElements = () => {
     const map = mapRef.current;
     const canvas = pathsCanvasRef.current;
@@ -183,13 +182,13 @@ export default function App() {
 
     ctx.clearRect(0, 0, width, height);
 
-    // Pass A: Render Planned Land / Ferry Paths
+    // Pass A: Render Planned Land / Ferry Paths & Hollow Destination Rings
     ctx.save();
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
 
     dotsRef.current.forEach((dot) => {
-      const { waypoints, waterFlags, segIdx, pos } = dot;
+      const { waypoints, waterFlags, segIdx, pos, radius } = dot;
       if (!waypoints || waypoints.length <= 1 || segIdx >= waypoints.length - 1) return;
 
       // Draw all upcoming segments starting from unit's live coordinate
@@ -206,19 +205,24 @@ export default function App() {
         ctx.stroke();
       }
 
-      // Draw hollow target ring at final waypoint destination
-      const destPt = map.latLngToContainerPoint(waypoints[waypoints.length - 1]);
-      ctx.beginPath();
-      ctx.setLineDash([6, 6]);
-      ctx.strokeStyle = OUR_TEAM_COLOR;
-      ctx.lineWidth = 2;
-      ctx.arc(destPt.x, destPt.y, 14, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.setLineDash([]);
+      // Draw hollow target ring matching unit's outer radius in meters
+      const dest = waypoints[waypoints.length - 1];
+      const destPt = map.latLngToContainerPoint(dest);
+      const destRadiusPx = getMetersToPixels(map, dest[0], radius);
+
+      if (destRadiusPx > 0) {
+        ctx.beginPath();
+        ctx.setLineDash([6, 6]);
+        ctx.strokeStyle = OUR_TEAM_COLOR;
+        ctx.lineWidth = 2;
+        ctx.arc(destPt.x, destPt.y, destRadiusPx, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
     });
     ctx.restore();
 
-    // Pass B: Render Unit Vision Circles (Directly converted from ground meters)
+    // Pass B: Render Unit Vision Circles
     ctx.save();
     dotsRef.current.forEach((dot) => {
       const pt = map.latLngToContainerPoint(dot.pos);
@@ -305,11 +309,12 @@ export default function App() {
       const map = L.map(mapContainerRef.current, {
         minZoom: 10,
         zoomControl: false,
+        // Requested settings:
         zoomAnimation: true,
-        zoomAnimationDuration: 1,
-        wheelDebounceTime: 60,
-        zoomDelta: 0.2,
-        wheelPxPerZoomLevel: 120,
+        zoomAnimationDuration: 0,
+        zoomSnap: 0.25,
+        zoomDelta: 0.25,
+        wheelPxPerZoomLevel: 90,
       }).setView([22.3193, 114.1694], 12);
 
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -346,7 +351,12 @@ export default function App() {
       // Continuous direct frame synchronization on zoom & pan
       map.on("zoom", renderAllCanvases);
       map.on("move", renderAllCanvases);
-      map.on("zoomend", syncCanvasSize);
+      map.on("zoomend", () => {
+        dotsRef.current.forEach((d) => {
+          if (d.layers.dotEmoji) d.layers.dotEmoji.setLatLng(d.pos);
+        });
+        syncCanvasSize();
+      });
 
       mapRef.current = map;
 
@@ -699,7 +709,22 @@ export default function App() {
         overscrollBehavior: "none",
       }}
     >
-      {/* Layer 1: Dynamic Paths & Unit Circles (zIndex: 420) */}
+      {/* 
+        CRITICAL OVERRIDE:
+        Disables CSS transition on Leaflet marker panes and animated layers.
+        This forces the DOM markers/emojis to snap immediately with 0 latency,
+        matching the instant redraw of the Canvas layers.
+      */}
+      <style>{`
+        .leaflet-zoom-anim .leaflet-zoom-animated,
+        .leaflet-marker-pane,
+        .leaflet-marker-icon {
+          transition: none !important;
+          -webkit-transition: none !important;
+        }
+      `}</style>
+
+      {/* Layer 1: Dynamic Paths, Hollow Destination, & Unit Circles (zIndex: 420) */}
       <canvas
         ref={pathsCanvasRef}
         style={{
