@@ -46,14 +46,13 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-function getPixelRadius(map, centerLatLng, meters) {
-  if (!map || meters <= 0) return 0;
-  const centerPt = map.latLngToLayerPoint(centerLatLng);
-  const offsetLatLng = L.latLng(centerLatLng[0] + meters / 111139.0, centerLatLng[1]);
-  const offsetPt = map.latLngToLayerPoint(offsetLatLng);
-  return Math.hypot(centerPt.x - offsetPt.x, centerPt.y - offsetPt.y);
+function getMetersToPixels(map, lat, meters) {
+  const latRad = lat * (Math.PI / 180);
+  const metersPerPx = (40075016.686 * Math.cos(latRad)) / (256 * Math.pow(2, map.getZoom()));
+  return meters / metersPerPx;
 }
 
+// In-memory icon texture cache
 const iconTextureCache = new Map();
 
 function getPrebakedEmojiIcon(symbol, color = OUR_TEAM_COLOR, isStrongGlow = false, opacity = 1.0) {
@@ -86,6 +85,7 @@ function getPrebakedEmojiIcon(symbol, color = OUR_TEAM_COLOR, isStrongGlow = fal
     ctx.shadowBlur = 18 * scale;
     ctx.fillText(symbol, center, center);
 
+    ctx.shadowColor = "#ffffff";
     ctx.shadowBlur = 10 * scale;
     ctx.fillText(symbol, center, center);
 
@@ -162,18 +162,16 @@ function buildPathSegments(dot) {
 export default function App() {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
-  const fogRendererRef = useRef(null);
   const defaultBboxRef = useRef(null);
-
-  const [gameStarted, setGameStarted] = useState(false);
-  const gameStartedRef = useRef(false);
+  const fogCanvasRef = useRef(null);
 
   const isZoomingRef = useRef(false);
-  const teamZIndexCounter = useRef(1000);
 
+  // Selected State
   const [selectedId, setSelectedId] = useState(null);
   const selectedIdRef = useRef(null);
 
+  // Reactive UI state
   const [dotsUI, setDotsUI] = useState(
     DOT_CONFIGS.map((cfg) => ({
       id: cfg.id,
@@ -185,12 +183,12 @@ export default function App() {
       distLeft: "--",
       speed: 20.0,
       radius: 25,
-      sight: 500,
     }))
   );
 
+  // Engine state for 60fps tracking
   const dotsRef = useRef(
-    DOT_CONFIGS.map((cfg, idx) => ({
+    DOT_CONFIGS.map((cfg) => ({
       id: cfg.id,
       name: cfg.name,
       symbol: cfg.symbol,
@@ -198,8 +196,6 @@ export default function App() {
       state: "Stop",
       speed: 20.0,
       radius: 25,
-      sight: 500,
-      zIndex: (4 - idx) * 100,
       waypoints: [],
       waterFlags: [],
       segIdx: 0,
@@ -217,66 +213,57 @@ export default function App() {
     }))
   );
 
-  const opponentsRef = useRef([]);
-
-  // Synchronous, zero-flicker fog drawing logic
-  const renderFog = () => {
-    const fogRenderer = fogRendererRef.current;
+  // High-performance 2D Canvas Fog Renderer: 400m solid bright -> 600m solid dark
+  const drawFog = () => {
     const map = mapRef.current;
-    if (!fogRenderer || !fogRenderer._container || !fogRenderer._ctx || !map) return;
+    const canvas = fogCanvasRef.current;
+    if (!map || !canvas) return;
 
-    const ctx = fogRenderer._ctx;
-    const bounds = fogRenderer._bounds;
-    if (!bounds) return;
+    const ctx = canvas.getContext("2d");
+    const width = canvas.width;
+    const height = canvas.height;
 
-    const size = bounds.getSize();
-    const min = bounds.min;
+    // 1. Fill entire canvas with dark tactical military tone
+    ctx.globalCompositeOperation = "source-over";
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = "rgba(7, 14, 23, 0.72)";
+    ctx.fillRect(0, 0, width, height);
 
-    ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    if (L.Browser.retina) {
-      ctx.scale(2, 2);
-    }
-    ctx.translate(-min.x, -min.y);
+    // 2. Punch out holes using destination-out
+    ctx.globalCompositeOperation = "destination-out";
 
-    ctx.clearRect(min.x, min.y, size.x, size.y);
+    dotsRef.current.forEach((dot) => {
+      const pt = map.latLngToContainerPoint(dot.pos);
+      const r400 = getMetersToPixels(map, dot.pos[0], 400);
+      const r600 = getMetersToPixels(map, dot.pos[0], 600);
 
-    if (gameStartedRef.current) {
-      ctx.globalCompositeOperation = "source-over";
-      ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
-      ctx.fillRect(min.x, min.y, size.x, size.y);
+      if (r600 <= 0) return;
 
-      ctx.globalCompositeOperation = "destination-out";
+      // Inner 400m: 100% erased (bright daylight)
+      ctx.fillStyle = "rgba(0, 0, 0, 1)";
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, Math.max(0, r400), 0, Math.PI * 2);
+      ctx.fill();
 
-      dotsRef.current.forEach((dot) => {
-        const pt = map.latLngToLayerPoint(dot.pos);
-        const innerMeters = Math.max(0, dot.sight - 100);
-        const outerMeters = dot.sight + 100;
+      // 400m to 600m: Smooth gradient transition dissolve
+      const grad = ctx.createRadialGradient(pt.x, pt.y, Math.max(0, r400), pt.x, pt.y, r600);
+      grad.addColorStop(0, "rgba(0, 0, 0, 1)");
+      grad.addColorStop(1, "rgba(0, 0, 0, 0)");
 
-        const rInner = getPixelRadius(map, dot.pos, innerMeters);
-        const rOuter = getPixelRadius(map, dot.pos, outerMeters);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, r600, 0, Math.PI * 2);
+      ctx.fill();
+    });
 
-        if (rOuter > 0) {
-          const grad = ctx.createRadialGradient(pt.x, pt.y, rInner, pt.x, pt.y, rOuter);
-          grad.addColorStop(0, "rgba(0, 0, 0, 1)");
-          grad.addColorStop(1, "rgba(0, 0, 0, 0)");
-
-          ctx.fillStyle = grad;
-          ctx.beginPath();
-          ctx.arc(pt.x, pt.y, rOuter, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      });
-    }
-
-    ctx.restore();
+    ctx.globalCompositeOperation = "source-over";
   };
 
-  // 1. Initialize Map, Panes, Team & Opponents
+  // 1. Initialize Map, Player Team & Opponents
   useEffect(() => {
     if (!mapRef.current) {
       const map = L.map(mapContainerRef.current, {
-        minZoom: 11,
+        minZoom: 10,
         zoomControl: false,
         zoomAnimation: true,
         zoomAnimationDuration: 0.15,
@@ -284,71 +271,18 @@ export default function App() {
         wheelPxPerZoomLevel: 90,
       }).setView([22.3193, 114.1694], 12);
 
-      // Tile layer with aggressive buffer caching to eliminate raster tile flicker
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        minZoom: 11,
+        minZoom: 10,
         maxZoom: 19,
-        attribution: false,
-        keepBuffer: 16, // Keeps 16 rows/cols of tiles cached outside view
-        updateWhenIdle: false, // Load continuously
-        updateWhenZooming: false,
-        updateInterval: 80,
+        attribution: "© OpenStreetMap",
       }).addTo(map);
 
-      // --- CREATION OF STRICT Z-INDEX PANES ---
-      // 9. Circle of remaining opponents (zIndex: 300)
-      map.createPane("outOfSightOpponentCirclesPane");
-      map.getPane("outOfSightOpponentCirclesPane").style.zIndex = 300;
+      const canvasRenderer = L.canvas({ padding: 0.5 });
 
-      // 8. Remaining opponents (zIndex: 350)
-      map.createPane("outOfSightOpponentsPane");
-      map.getPane("outOfSightOpponentsPane").style.zIndex = 350;
-
-      // 7. Fog Pane (zIndex: 400)
-      map.createPane("fogPane");
-      map.getPane("fogPane").style.zIndex = 400;
-
-      // Broad padding (0.8) so chunk updates happen far outside view
-      const fogRenderer = L.canvas({ pane: "fogPane", padding: 0.1 });
-      fogRenderer.addTo(map);
-      fogRendererRef.current = fogRenderer;
-
-      // CRUCIAL: Hook directly into Leaflet's synchronous _draw step.
-      // Whenever Leaflet resizes the canvas for a new chunk, it calls _draw synchronously
-      // before the frame is painted to the display, eliminating the blank flicker completely!
-      fogRenderer._draw = () => {
-        renderFog();
-      };
-
-      // 6. Circle of opponents within sight (zIndex: 450)
-      map.createPane("inSightOpponentCirclesPane");
-      map.getPane("inSightOpponentCirclesPane").style.zIndex = 450;
-
-      // 5. Circle of team members (zIndex: 500)
-      map.createPane("teamCirclesPane");
-      map.getPane("teamCirclesPane").style.zIndex = 500;
-
-      // 4. Path routes (zIndex: 550)
-      map.createPane("pathsPane");
-      map.getPane("pathsPane").style.zIndex = 550;
-
-      // 3. All opponents within sight (zIndex: 600)
-      map.createPane("inSightOpponentsPane");
-      map.getPane("inSightOpponentsPane").style.zIndex = 600;
-
-      // 2. All team members (zIndex: 650)
-      map.createPane("teamMembersPane");
-      map.getPane("teamMembersPane").style.zIndex = 650;
-
-      const teamCirclesRenderer = L.canvas({ padding: 0.8, pane: "teamCirclesPane" });
-      const pathsRenderer = L.canvas({ padding: 0.8, pane: "pathsPane" });
-      const inSightCirclesRenderer = L.canvas({ padding: 0.8, pane: "inSightOpponentCirclesPane" });
-      const outOfSightCirclesRenderer = L.canvas({ padding: 0.8, pane: "outOfSightOpponentCirclesPane" });
-
+      // Controllable Player Units (Crimson Red)
       dotsRef.current.forEach((dot) => {
         const dotOuter = L.circle(dot.pos, {
-          renderer: teamCirclesRenderer,
-          pane: "teamCirclesPane",
+          renderer: canvasRenderer,
           radius: dot.radius,
           color: OUR_TEAM_COLOR,
           weight: 1,
@@ -359,14 +293,11 @@ export default function App() {
 
         const dotEmoji = L.marker(dot.pos, {
           icon: getPrebakedEmojiIcon(dot.symbol, OUR_TEAM_COLOR, false, 1.0),
-          pane: "teamMembersPane",
-          zIndexOffset: dot.zIndex,
           interactive: false,
         }).addTo(map);
 
         const landPath = L.polyline([], {
-          renderer: pathsRenderer,
-          pane: "pathsPane",
+          renderer: canvasRenderer,
           color: "#1e824c",
           weight: 5,
           opacity: 0.55,
@@ -374,8 +305,7 @@ export default function App() {
         }).addTo(map);
 
         const waterPath = L.polyline([], {
-          renderer: pathsRenderer,
-          pane: "pathsPane",
+          renderer: canvasRenderer,
           color: "#0077be",
           weight: 5,
           opacity: 0.55,
@@ -383,8 +313,7 @@ export default function App() {
         }).addTo(map);
 
         const hollowDest = L.circle([0, 0], {
-          renderer: teamCirclesRenderer,
-          pane: "teamCirclesPane",
+          renderer: canvasRenderer,
           radius: 15,
           color: OUR_TEAM_COLOR,
           weight: 2,
@@ -396,14 +325,27 @@ export default function App() {
         dot.layers = { dotOuter, dotEmoji, landPath, waterPath, hollowDest };
       });
 
-      // Zoom lifecycle events
+      // Resize and attach Fog Canvas
+      const handleResize = () => {
+        if (fogCanvasRef.current) {
+          fogCanvasRef.current.width = window.innerWidth;
+          fogCanvasRef.current.height = window.innerHeight;
+          drawFog();
+        }
+      };
+      handleResize();
+      window.addEventListener("resize", handleResize);
+
+      // Keep fog attached to the map continuously during zoom and pan
+      map.on("zoom", drawFog);
+      map.on("move", drawFog);
+
       map.on("zoomstart", () => {
         isZoomingRef.current = true;
       });
 
       map.on("zoomend", () => {
         isZoomingRef.current = false;
-
         dotsRef.current.forEach((dot) => {
           dot.layers.dotOuter.setLatLng(dot.pos);
           dot.layers.dotEmoji.setLatLng(dot.pos);
@@ -412,17 +354,18 @@ export default function App() {
           dot.layers.landPath.setLatLngs(landMulti);
           dot.layers.waterPath.setLatLngs(waterMulti);
         });
-
-        renderFog();
+        drawFog();
       });
 
       mapRef.current = map;
 
+      // Scatter player and 44 opponents asynchronously
       initGraph()
         .then(async ({ bbox }) => {
           defaultBboxRef.current = bbox;
           map.fitBounds(bbox);
 
+          // 1. Scatter our 4 controllable characters
           const playerSnapPromises = dotsRef.current.map(() => {
             const randLat = bbox[0][0] + Math.random() * (bbox[1][0] - bbox[0][0]);
             const randLon = bbox[0][1] + Math.random() * (bbox[1][1] - bbox[0][1]);
@@ -437,6 +380,9 @@ export default function App() {
             dot.layers.dotEmoji.setLatLng(res.pt);
           });
 
+          drawFog();
+
+          // 2. Scatter remaining 44 characters (Teams 2 to 12)
           const opponentPromises = [];
           for (let teamIdx = 1; teamIdx < TEAM_COLORS.length; teamIdx++) {
             const teamColor = TEAM_COLORS[teamIdx];
@@ -454,22 +400,9 @@ export default function App() {
           }
 
           const opponentUnits = await Promise.all(opponentPromises);
-          opponentsRef.current = opponentUnits.map(({ pt, symbol, teamColor }) => {
-            const circleInSight = L.circle(pt, {
-              renderer: inSightCirclesRenderer,
-              pane: "inSightOpponentCirclesPane",
-              radius: 25,
-              color: teamColor,
-              weight: 1,
-              opacity: 0,
-              fillColor: teamColor,
-              fillOpacity: 0,
-              interactive: false,
-            }).addTo(map);
-
-            const circleOutOfSight = L.circle(pt, {
-              renderer: outOfSightCirclesRenderer,
-              pane: "outOfSightOpponentCirclesPane",
+          opponentUnits.forEach(({ pt, symbol, teamColor }) => {
+            L.circle(pt, {
+              renderer: canvasRenderer,
               radius: 25,
               color: teamColor,
               weight: 1,
@@ -479,27 +412,21 @@ export default function App() {
               interactive: false,
             }).addTo(map);
 
-            const marker = L.marker(pt, {
-              icon: getPrebakedEmojiIcon(symbol, teamColor, false, 1.0),
-              pane: "outOfSightOpponentsPane",
+            L.marker(pt, {
+              icon: getPrebakedEmojiIcon(symbol, teamColor, false, 0.5),
               interactive: false,
             }).addTo(map);
-
-            return {
-              pos: pt,
-              symbol,
-              teamColor,
-              circleInSight,
-              circleOutOfSight,
-              marker,
-            };
           });
         })
         .catch((err) => console.error("Init Error:", err));
+
+      return () => {
+        window.removeEventListener("resize", handleResize);
+      };
     }
   }, []);
 
-  // 2. High-Performance Movement, Scaling & Synchronous Fog Loop (60 FPS)
+  // 2. High-Performance Movement Engine (60 FPS)
   useEffect(() => {
     let animId;
     let lastTime = performance.now();
@@ -514,163 +441,85 @@ export default function App() {
         isZoomingRef.current ||
         Boolean(map && (map._animatingZoom || map._zooming || (map.touchZoom && map.touchZoom._zooming)));
 
-      const isStarted = gameStartedRef.current;
+      dotsRef.current.forEach((dot) => {
+        const { state, waypoints, layers } = dot;
+        let segIdx = dot.segIdx;
 
-      // 1. Team Movement
-      if (isStarted) {
-        dotsRef.current.forEach((dot) => {
-          const { state, waypoints, layers } = dot;
-          let segIdx = dot.segIdx;
+        const isFerryRedirect = state === "Redirecting" && dot.ferryTarget !== null;
+        const canMove = state === "Move" || state === "Ferry" || isFerryRedirect;
 
-          const isFerryRedirect = state === "Redirecting" && dot.ferryTarget !== null;
-          const canMove = state === "Move" || state === "Ferry" || isFerryRedirect;
+        if (canMove && waypoints.length > 1 && segIdx < waypoints.length - 1) {
+          let distanceToAdvance = dot.speed * dt;
 
-          if (canMove && waypoints.length > 1 && segIdx < waypoints.length - 1) {
-            let distanceToAdvance = dot.speed * dt;
-
-            while (distanceToAdvance > 0 && segIdx < waypoints.length - 1) {
-              if (isFerryRedirect && dot.ferryTarget) {
-                if (segIdx >= dot.ferryTarget.nodeIdx) {
-                  dot.pos = waypoints[dot.ferryTarget.nodeIdx];
-                  distanceToAdvance = 0;
-                  break;
-                }
-              }
-
-              const p1 = dot.pos;
-              const p2 = waypoints[segIdx + 1];
-              const segDist = haversineMeters(p1[0], p1[1], p2[0], p2[1]);
-
-              if (distanceToAdvance < segDist) {
-                const t = distanceToAdvance / segDist;
-                dot.pos = [p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t];
+          while (distanceToAdvance > 0 && segIdx < waypoints.length - 1) {
+            if (isFerryRedirect && dot.ferryTarget) {
+              if (segIdx >= dot.ferryTarget.nodeIdx) {
+                dot.pos = waypoints[dot.ferryTarget.nodeIdx];
                 distanceToAdvance = 0;
-              } else {
-                distanceToAdvance -= segDist;
-                dot.pos = p2;
-                segIdx++;
-                dot.segIdx = segIdx;
-
-                if (isFerryRedirect && dot.ferryTarget && segIdx >= dot.ferryTarget.nodeIdx) {
-                  distanceToAdvance = 0;
-                  break;
-                }
+                break;
               }
             }
 
-            if (!isZooming) {
-              layers.dotOuter.setLatLng(dot.pos);
-              layers.dotEmoji.setLatLng(dot.pos);
+            const p1 = dot.pos;
+            const p2 = waypoints[segIdx + 1];
+            const segDist = haversineMeters(p1[0], p1[1], p2[0], p2[1]);
 
-              const { landMulti, waterMulti } = buildPathSegments(dot);
-              layers.landPath.setLatLngs(landMulti);
-              layers.waterPath.setLatLngs(waterMulti);
-            }
-
-            if (state !== "Redirecting") {
-              const isWater = dot.waterFlags[segIdx] === 1;
-              dot.state = isWater ? "Ferry" : "Move";
-            }
-
-            if (segIdx >= waypoints.length - 1) {
-              dot.state = "Stop";
-              dot.waypoints = [];
-              layers.landPath.setLatLngs([]);
-              layers.waterPath.setLatLngs([]);
-              dot.timeLeft = "--";
-              dot.eta = "--";
-              dot.distLeft = "--";
+            if (distanceToAdvance < segDist) {
+              const t = distanceToAdvance / segDist;
+              dot.pos = [p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t];
+              distanceToAdvance = 0;
             } else {
-              let remDist = haversineMeters(dot.pos[0], dot.pos[1], waypoints[segIdx + 1][0], waypoints[segIdx + 1][1]);
-              for (let i = segIdx + 1; i < waypoints.length - 1; i++) {
-                remDist += haversineMeters(waypoints[i][0], waypoints[i][1], waypoints[i + 1][0], waypoints[i + 1][1]);
+              distanceToAdvance -= segDist;
+              dot.pos = p2;
+              segIdx++;
+              dot.segIdx = segIdx;
+
+              if (isFerryRedirect && dot.ferryTarget && segIdx >= dot.ferryTarget.nodeIdx) {
+                distanceToAdvance = 0;
+                break;
               }
-              const remSec = remDist / dot.speed;
-              dot.timeLeft = remSec.toFixed(1) + "s";
-              const etaDate = new Date(Date.now() + remSec * 1000);
-              dot.eta = etaDate.toLocaleTimeString([], { hour12: false });
-              dot.distLeft = remDist > 1000 ? (remDist / 1000).toFixed(2) + " km" : remDist.toFixed(0) + " m";
             }
           }
-        });
-      }
 
-      // 2. Opponent Dynamics & Pane/Z-Index Sorting
-      if (map && opponentsRef.current.length > 0) {
-        const teamMembers = dotsRef.current;
+          if (!isZooming) {
+            layers.dotOuter.setLatLng(dot.pos);
+            layers.dotEmoji.setLatLng(dot.pos);
 
-        opponentsRef.current.forEach((opp) => {
-          if (!isStarted) {
-            if (opp.marker && opp.marker._icon) {
-              opp.marker._icon.style.width = "40px";
-              opp.marker._icon.style.height = "40px";
-              opp.marker._icon.style.marginLeft = "-20px";
-              opp.marker._icon.style.marginTop = "-20px";
-            }
-            return;
+            const { landMulti, waterMulti } = buildPathSegments(dot);
+            layers.landPath.setLatLngs(landMulti);
+            layers.waterPath.setLatLngs(waterMulti);
           }
 
-          let minT = Infinity;
-          let inSight = false;
-
-          for (let m = 0; m < teamMembers.length; m++) {
-            const member = teamMembers[m];
-            const dist = haversineMeters(member.pos[0], member.pos[1], opp.pos[0], opp.pos[1]);
-            if (dist <= member.sight) {
-              inSight = true;
-            }
-            const s = Math.max(0.1, member.speed);
-            const t = dist / s;
-            if (t < minT) minT = t;
+          if (state !== "Redirecting") {
+            const isWater = dot.waterFlags[segIdx] === 1;
+            dot.state = isWater ? "Ferry" : "Move";
           }
 
-          let scale = 1.0;
-          if (minT <= 5) {
-            scale = 1.0;
-          } else if (minT >= 60) {
-            scale = 0.4;
+          if (segIdx >= waypoints.length - 1) {
+            dot.state = "Stop";
+            dot.waypoints = [];
+            layers.landPath.setLatLngs([]);
+            layers.waterPath.setLatLngs([]);
+            dot.timeLeft = "--";
+            dot.eta = "--";
+            dot.distLeft = "--";
           } else {
-            scale = 1.0 - 0.6 * ((minT - 5) / 55.0);
-          }
-
-          if (opp.marker && opp.marker._icon) {
-            const size = Math.round(40 * scale);
-            const half = Math.round(size / 2);
-            opp.marker._icon.style.width = `${size}px`;
-            opp.marker._icon.style.height = `${size}px`;
-            opp.marker._icon.style.marginLeft = `-${half}px`;
-            opp.marker._icon.style.marginTop = `-${half}px`;
-
-            const targetPaneName = inSight ? "inSightOpponentsPane" : "outOfSightOpponentsPane";
-            const targetPaneElem = map.getPane(targetPaneName);
-            if (targetPaneElem && opp.marker._icon.parentNode !== targetPaneElem) {
-              targetPaneElem.appendChild(opp.marker._icon);
+            let remDist = haversineMeters(dot.pos[0], dot.pos[1], waypoints[segIdx + 1][0], waypoints[segIdx + 1][1]);
+            for (let i = segIdx + 1; i < waypoints.length - 1; i++) {
+              remDist += haversineMeters(waypoints[i][0], waypoints[i][1], waypoints[i + 1][0], waypoints[i + 1][1]);
             }
-
-            if (inSight) {
-              const zOffset = Math.round(10000 - Math.min(10000, minT * 100));
-              opp.marker.setZIndexOffset(zOffset);
-            } else {
-              opp.marker.setZIndexOffset(0);
-            }
+            const remSec = remDist / dot.speed;
+            dot.timeLeft = remSec.toFixed(1) + "s";
+            const etaDate = new Date(Date.now() + remSec * 1000);
+            dot.eta = etaDate.toLocaleTimeString([], { hour12: false });
+            dot.distLeft = remDist > 1000 ? (remDist / 1000).toFixed(2) + " km" : remDist.toFixed(0) + " m";
           }
+        }
+      });
 
-          if (inSight) {
-            opp.circleInSight.setStyle({ opacity: 0.5, fillOpacity: 0.125 });
-            opp.circleOutOfSight.setStyle({ opacity: 0, fillOpacity: 0 });
-          } else {
-            opp.circleInSight.setStyle({ opacity: 0, fillOpacity: 0 });
-            opp.circleOutOfSight.setStyle({ opacity: 0.5, fillOpacity: 0.125 });
-          }
-        });
-      }
+      // Continuously update fog vision holes with player movements
+      drawFog();
 
-      // 3. Render Fog during animation (if not zoom animating)
-      if (!isZooming) {
-        renderFog();
-      }
-
-      // UI Sync
       if (now - lastUIUpdate > 100) {
         setDotsUI(
           dotsRef.current.map((d) => ({
@@ -683,7 +532,6 @@ export default function App() {
             distLeft: d.distLeft,
             speed: d.speed,
             radius: d.radius,
-            sight: d.sight,
           }))
         );
         lastUIUpdate = now;
@@ -696,9 +544,8 @@ export default function App() {
     return () => cancelAnimationFrame(animId);
   }, []);
 
-  // 3. Selection & Dynamic Team Member zIndex
+  // 3. Selection & Glowing Control
   const handleToggleSelect = (id) => {
-    if (!gameStartedRef.current) return;
     const map = mapRef.current;
     if (!map) return;
 
@@ -714,12 +561,6 @@ export default function App() {
       const dot = dotsRef.current[id];
       if (dot) {
         map.panTo(dot.pos, { animate: true, duration: 0.6 });
-
-        teamZIndexCounter.current += 10;
-        dot.zIndex = teamZIndexCounter.current;
-        if (dot.layers.dotEmoji) {
-          dot.layers.dotEmoji.setZIndexOffset(dot.zIndex);
-        }
       }
     }
 
@@ -732,13 +573,11 @@ export default function App() {
     });
   };
 
-  // 4. Targeted Map Click Rerouting (Blocked before game starts)
+  // 4. Targeted Map Click Rerouting
   useEffect(() => {
     if (!mapRef.current) return;
 
     const onMapClick = async (e) => {
-      if (!gameStartedRef.current) return;
-
       const activeId = selectedIdRef.current;
       if (activeId === null) return;
 
@@ -842,24 +681,15 @@ export default function App() {
     return () => map.off("click", onMapClick);
   }, []);
 
-  // --- START GAME HANDLER ---
-  const handleStartGame = () => {
-    gameStartedRef.current = true;
-    setGameStarted(true);
-    renderFog();
-  };
-
   // --- BUTTON HANDLERS ---
   const handleAddSpeed = (id, e) => {
     e.stopPropagation();
-    if (!gameStartedRef.current) return;
     const dot = dotsRef.current[id];
     if (dot) dot.speed += 5.0;
   };
 
   const handleAddRadius = (id, e) => {
     e.stopPropagation();
-    if (!gameStartedRef.current) return;
     const dot = dotsRef.current[id];
     if (dot) {
       dot.radius += 10;
@@ -867,16 +697,8 @@ export default function App() {
     }
   };
 
-  const handleAddSight = (id, e) => {
-    e.stopPropagation();
-    if (!gameStartedRef.current) return;
-    const dot = dotsRef.current[id];
-    if (dot) dot.sight += 50;
-  };
-
   const handleTeleport = (id, e) => {
     e.stopPropagation();
-    if (!gameStartedRef.current) return;
     const dot = dotsRef.current[id];
     if (!dot || !dot.waypoints || dot.waypoints.length === 0) return;
 
@@ -896,6 +718,8 @@ export default function App() {
     dot.timeLeft = "--";
     dot.eta = "--";
     dot.distLeft = "--";
+
+    drawFog();
   };
 
   const selectedDotUI = dotsUI.find((d) => d.id === selectedId);
@@ -913,44 +737,30 @@ export default function App() {
         overflow: "hidden",
       }}
     >
-      {/* 1. White Round Start Game Button on Top-Left (zIndex: 1100) */}
-      {!gameStarted && (
-        <button
-          onClick={handleStartGame}
-          title="Start Game"
-          style={{
-            position: "absolute",
-            top: 20,
-            left: 20,
-            zIndex: 1100,
-            width: "52px",
-            height: "52px",
-            borderRadius: "50%",
-            backgroundColor: "#ffffff",
-            border: "none",
-            boxShadow: "0 4px 14px rgba(0, 0, 0, 0.25)",
-            fontSize: "24px",
-            color: "#111",
-            cursor: "pointer",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            userSelect: "none",
-            outline: "none",
-            transition: "transform 0.15s ease",
-          }}
-          onMouseDown={(e) => (e.currentTarget.style.transform = "scale(0.92)")}
-          onMouseUp={(e) => (e.currentTarget.style.transform = "scale(1)")}
-        >
-          ▷
-        </button>
-      )}
+      {/* 
+        High-Performance Hardware Canvas Fog of War Layer (zIndex: 450)
+        - Covers the whole map in tactical dark veil
+        - Erases 400m solid daylight holes and 400m-600m gradient transition
+        - Attached and updated continuously on map zoom and pan
+      */}
+      <canvas
+        ref={fogCanvasRef}
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          width: "100%",
+          height: "100%",
+          pointerEvents: "none",
+          zIndex: 450,
+        }}
+      />
 
-      {/* 4 White Circle Buttons on Bottom-Left in a Vertical Line (zIndex: 1000) */}
+      {/* 4 White Circle Buttons on Bottom-Left in a Vertical Line */}
       <div
         style={{
           position: "absolute",
-          bottom: 100,
+          bottom: 20,
           left: 16,
           zIndex: 1000,
           display: "flex",
@@ -991,20 +801,20 @@ export default function App() {
         })}
       </div>
 
-      {/* Slide-Up Popup Panel (zIndex: 1000) */}
+      {/* Slide-Up Popup Panel */}
       <div
         style={{
           position: "absolute",
-          bottom: 100,
+          bottom: 0,
           left: 76,
           right: 0,
-          zIndex: 1000,
+          zIndex: 999,
           backgroundColor: "rgba(255, 255, 255, 0.95)",
           backdropFilter: "blur(8px)",
           boxShadow: "0 -4px 16px rgba(0, 0, 0, 0.15)",
           borderTop: "1.5px solid #e0e0e0",
           borderTopLeftRadius: "16px",
-          padding: "12px 18px 24px",
+          padding: "12px 18px",
           fontFamily: "system-ui, -apple-system, sans-serif",
           display: "flex",
           alignItems: "center",
@@ -1018,6 +828,7 @@ export default function App() {
       >
         {selectedDotUI && (
           <>
+            {/* Identity & State */}
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
               <span style={{ fontSize: "24px" }}>{selectedDotUI.symbol}</span>
               <div>
@@ -1040,6 +851,7 @@ export default function App() {
               </div>
             </div>
 
+            {/* Telemetry Stats */}
             <div style={{ display: "flex", gap: "14px", alignItems: "center" }}>
               <div style={{ fontSize: "12px", color: "#333" }}>
                 <span style={{ fontSize: "10px", color: "#888", display: "block" }}>ETA</span>
@@ -1061,12 +873,9 @@ export default function App() {
                 <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Radius</span>
                 <b>{selectedDotUI.radius} m</b>
               </div>
-              <div style={{ fontSize: "12px", color: "#333" }}>
-                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Sight</span>
-                <b>{selectedDotUI.sight} m</b>
-              </div>
             </div>
 
+            {/* Actions: Modifiers & Hide Button */}
             <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
               <button
                 onClick={(e) => handleAddSpeed(selectedDotUI.id, e)}
@@ -1097,21 +906,6 @@ export default function App() {
                 }}
               >
                 +10m
-              </button>
-              <button
-                onClick={(e) => handleAddSight(selectedDotUI.id, e)}
-                style={{
-                  padding: "5px 10px",
-                  background: "#ffc107",
-                  color: "#000",
-                  border: "none",
-                  borderRadius: "14px",
-                  fontSize: "11px",
-                  fontWeight: "bold",
-                  cursor: "pointer",
-                }}
-              >
-                +50m
               </button>
               <button
                 onClick={(e) => handleTeleport(selectedDotUI.id, e)}
