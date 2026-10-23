@@ -233,6 +233,7 @@ export default function App() {
     ctx.globalCompositeOperation = "destination-out";
 
     dotsRef.current.forEach((dot) => {
+      // Container point aligns 1:1 with canvas pixels because canvas dimensions match map.getSize()
       const pt = map.latLngToContainerPoint(dot.pos);
       const r400 = getMetersToPixels(map, dot.pos[0], 400);
       const r600 = getMetersToPixels(map, dot.pos[0], 600);
@@ -257,6 +258,20 @@ export default function App() {
     });
 
     ctx.globalCompositeOperation = "source-over";
+  };
+
+  // Sync canvas buffer pixels directly to Leaflet container size to prevent mobile offset
+  const syncCanvasSize = () => {
+    const map = mapRef.current;
+    const canvas = fogCanvasRef.current;
+    if (!map || !canvas) return;
+
+    const size = map.getSize();
+    if (canvas.width !== size.x || canvas.height !== size.y) {
+      canvas.width = size.x;
+      canvas.height = size.y;
+    }
+    drawFog();
   };
 
   // 1. Initialize Map, Player Team & Opponents
@@ -325,16 +340,19 @@ export default function App() {
         dot.layers = { dotOuter, dotEmoji, landPath, waterPath, hollowDest };
       });
 
-      // Resize and attach Fog Canvas
-      const handleResize = () => {
-        if (fogCanvasRef.current) {
-          fogCanvasRef.current.width = window.innerWidth;
-          fogCanvasRef.current.height = window.innerHeight;
-          drawFog();
-        }
+      // Handle dynamic mobile navigation bar collapsing/expanding
+      const handleViewportResize = () => {
+        map.invalidateSize({ animate: false });
+        syncCanvasSize();
       };
-      handleResize();
-      window.addEventListener("resize", handleResize);
+
+      window.addEventListener("resize", handleViewportResize);
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener("resize", handleViewportResize);
+      }
+
+      // Initial buffer calibration
+      syncCanvasSize();
 
       // Keep fog attached to the map continuously during zoom and pan
       map.on("zoom", drawFog);
@@ -354,7 +372,7 @@ export default function App() {
           dot.layers.landPath.setLatLngs(landMulti);
           dot.layers.waterPath.setLatLngs(waterMulti);
         });
-        drawFog();
+        syncCanvasSize();
       });
 
       mapRef.current = map;
@@ -380,7 +398,7 @@ export default function App() {
             dot.layers.dotEmoji.setLatLng(res.pt);
           });
 
-          drawFog();
+          syncCanvasSize();
 
           // 2. Scatter remaining 44 characters (Teams 2 to 12)
           const opponentPromises = [];
@@ -421,7 +439,10 @@ export default function App() {
         .catch((err) => console.error("Init Error:", err));
 
       return () => {
-        window.removeEventListener("resize", handleResize);
+        window.removeEventListener("resize", handleViewportResize);
+        if (window.visualViewport) {
+          window.visualViewport.removeEventListener("resize", handleViewportResize);
+        }
       };
     }
   }, []);
@@ -517,7 +538,7 @@ export default function App() {
         }
       });
 
-      // Continuously update fog vision holes with player movements
+      // Continuously redraw fog vision holes along moving units
       drawFog();
 
       if (now - lastUIUpdate > 100) {
@@ -731,17 +752,19 @@ export default function App() {
         top: 0,
         left: 0,
         width: "100vw",
+        width: "100dvw",
         height: "100vh",
+        height: "100dvh", // Automatically tracks mobile dynamic URL bar and bottom nav
         margin: 0,
         padding: 0,
         overflow: "hidden",
+        overscrollBehavior: "none", // Prevents mobile pull-to-refresh & rubber-banding
       }}
     >
       {/* 
-        High-Performance Hardware Canvas Fog of War Layer (zIndex: 450)
-        - Covers the whole map in tactical dark veil
-        - Erases 400m solid daylight holes and 400m-600m gradient transition
-        - Attached and updated continuously on map zoom and pan
+        High-Performance 2D Canvas Fog of War Layer (zIndex: 450)
+        - Locked to map.getSize() so the hole is perfectly centered on the emoji on mobile
+        - Redrawn continuously across zoom and pan
       */}
       <canvas
         ref={fogCanvasRef}
@@ -760,7 +783,7 @@ export default function App() {
       <div
         style={{
           position: "absolute",
-          bottom: 20,
+          bottom: "calc(16px + env(safe-area-inset-bottom, 0px))",
           left: 16,
           zIndex: 1000,
           display: "flex",
@@ -801,7 +824,7 @@ export default function App() {
         })}
       </div>
 
-      {/* Slide-Up Popup Panel */}
+      {/* Slide-Up Popup Panel (Connected to Bottom, accommodates safe area on iPhone) */}
       <div
         style={{
           position: "absolute",
@@ -815,6 +838,7 @@ export default function App() {
           borderTop: "1.5px solid #e0e0e0",
           borderTopLeftRadius: "16px",
           padding: "12px 18px",
+          paddingBottom: "max(12px, env(safe-area-inset-bottom))",
           fontFamily: "system-ui, -apple-system, sans-serif",
           display: "flex",
           alignItems: "center",
