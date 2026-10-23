@@ -119,53 +119,14 @@ function getPrebakedEmojiIcon(symbol, color = OUR_TEAM_COLOR, isStrongGlow = fal
   return icon;
 }
 
-function buildPathSegments(dot) {
-  const { pos, waypoints, waterFlags, segIdx } = dot;
-  if (!waypoints || waypoints.length <= 1 || segIdx >= waypoints.length - 1) {
-    return { landMulti: [], waterMulti: [] };
-  }
-
-  const landMulti = [];
-  const waterMulti = [];
-
-  let currentType = waterFlags[segIdx] === 1 ? "water" : "land";
-  let currentChunk = [pos, waypoints[segIdx + 1]];
-
-  for (let i = segIdx + 1; i < waypoints.length - 1; i++) {
-    const segType = waterFlags[i] === 1 ? "water" : "land";
-    const nextPt = waypoints[i + 1];
-
-    if (segType === currentType) {
-      currentChunk.push(nextPt);
-    } else {
-      if (currentType === "water") {
-        waterMulti.push(currentChunk);
-      } else {
-        landMulti.push(currentChunk);
-      }
-      currentType = segType;
-      currentChunk = [waypoints[i], nextPt];
-    }
-  }
-
-  if (currentChunk.length > 1) {
-    if (currentType === "water") {
-      waterMulti.push(currentChunk);
-    } else {
-      landMulti.push(currentChunk);
-    }
-  }
-
-  return { landMulti, waterMulti };
-}
-
 export default function App() {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
   const defaultBboxRef = useRef(null);
-  const fogCanvasRef = useRef(null);
 
-  const isZoomingRef = useRef(false);
+  // Dedicated dynamic 2D canvas overlays
+  const pathsCanvasRef = useRef(null);
+  const fogCanvasRef = useRef(null);
 
   // Selected State
   const [selectedId, setSelectedId] = useState(null);
@@ -202,18 +163,81 @@ export default function App() {
       nextAllowedClick: 0,
       redirectStart: 0,
       ferryTarget: null,
+      targetDest: null,
       distLeft: "--",
       layers: {
-        dotOuter: null,
         dotEmoji: null,
-        landPath: null,
-        waterPath: null,
-        hollowDest: null,
       },
     }))
   );
 
-  // High-performance 2D Canvas Fog Renderer: 400m solid bright -> 600m solid dark
+  // 1. Draw Paths & Unit Ground Circles onto Screen Canvas (zIndex: 420)
+  const drawDynamicElements = () => {
+    const map = mapRef.current;
+    const canvas = pathsCanvasRef.current;
+    if (!map || !canvas) return;
+
+    const ctx = canvas.getContext("2d");
+    const width = canvas.width;
+    const height = canvas.height;
+
+    ctx.clearRect(0, 0, width, height);
+
+    // Pass A: Render Planned Land / Ferry Paths
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    dotsRef.current.forEach((dot) => {
+      const { waypoints, waterFlags, segIdx, pos } = dot;
+      if (!waypoints || waypoints.length <= 1 || segIdx >= waypoints.length - 1) return;
+
+      // Draw all upcoming segments starting from unit's live coordinate
+      for (let i = segIdx; i < waypoints.length - 1; i++) {
+        const isWater = waterFlags[i] === 1;
+        const startPt = i === segIdx ? map.latLngToContainerPoint(pos) : map.latLngToContainerPoint(waypoints[i]);
+        const endPt = map.latLngToContainerPoint(waypoints[i + 1]);
+
+        ctx.beginPath();
+        ctx.strokeStyle = isWater ? "rgba(0, 119, 190, 0.65)" : "rgba(30, 130, 76, 0.65)";
+        ctx.lineWidth = 5;
+        ctx.moveTo(startPt.x, startPt.y);
+        ctx.lineTo(endPt.x, endPt.y);
+        ctx.stroke();
+      }
+
+      // Draw hollow target ring at final waypoint destination
+      const destPt = map.latLngToContainerPoint(waypoints[waypoints.length - 1]);
+      ctx.beginPath();
+      ctx.setLineDash([6, 6]);
+      ctx.strokeStyle = OUR_TEAM_COLOR;
+      ctx.lineWidth = 2;
+      ctx.arc(destPt.x, destPt.y, 14, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    });
+    ctx.restore();
+
+    // Pass B: Render Unit Vision Circles (Directly converted from ground meters)
+    ctx.save();
+    dotsRef.current.forEach((dot) => {
+      const pt = map.latLngToContainerPoint(dot.pos);
+      const radiusPx = getMetersToPixels(map, dot.pos[0], dot.radius);
+
+      if (radiusPx > 0) {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, radiusPx, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(213, 0, 0, 0.25)";
+        ctx.fill();
+        ctx.strokeStyle = OUR_TEAM_COLOR;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+    });
+    ctx.restore();
+  };
+
+  // 2. Draw Fog of War onto Screen Canvas (zIndex: 450)
   const drawFog = () => {
     const map = mapRef.current;
     const canvas = fogCanvasRef.current;
@@ -223,30 +247,25 @@ export default function App() {
     const width = canvas.width;
     const height = canvas.height;
 
-    // 1. Fill entire canvas with dark tactical military tone
     ctx.globalCompositeOperation = "source-over";
     ctx.clearRect(0, 0, width, height);
     ctx.fillStyle = "rgba(7, 14, 23, 0.72)";
     ctx.fillRect(0, 0, width, height);
 
-    // 2. Punch out holes using destination-out
     ctx.globalCompositeOperation = "destination-out";
 
     dotsRef.current.forEach((dot) => {
-      // Container point aligns 1:1 with canvas pixels because canvas dimensions match map.getSize()
       const pt = map.latLngToContainerPoint(dot.pos);
       const r400 = getMetersToPixels(map, dot.pos[0], 400);
       const r600 = getMetersToPixels(map, dot.pos[0], 600);
 
       if (r600 <= 0) return;
 
-      // Inner 400m: 100% erased (bright daylight)
       ctx.fillStyle = "rgba(0, 0, 0, 1)";
       ctx.beginPath();
       ctx.arc(pt.x, pt.y, Math.max(0, r400), 0, Math.PI * 2);
       ctx.fill();
 
-      // 400m to 600m: Smooth gradient transition dissolve
       const grad = ctx.createRadialGradient(pt.x, pt.y, Math.max(0, r400), pt.x, pt.y, r600);
       grad.addColorStop(0, "rgba(0, 0, 0, 1)");
       grad.addColorStop(1, "rgba(0, 0, 0, 0)");
@@ -260,18 +279,24 @@ export default function App() {
     ctx.globalCompositeOperation = "source-over";
   };
 
-  // Sync canvas buffer pixels directly to Leaflet container size to prevent mobile offset
+  const renderAllCanvases = () => {
+    drawDynamicElements();
+    drawFog();
+  };
+
   const syncCanvasSize = () => {
     const map = mapRef.current;
-    const canvas = fogCanvasRef.current;
-    if (!map || !canvas) return;
-
+    if (!map) return;
     const size = map.getSize();
-    if (canvas.width !== size.x || canvas.height !== size.y) {
-      canvas.width = size.x;
-      canvas.height = size.y;
-    }
-    drawFog();
+
+    [pathsCanvasRef.current, fogCanvasRef.current].forEach((cv) => {
+      if (cv && (cv.width !== size.x || cv.height !== size.y)) {
+        cv.width = size.x;
+        cv.height = size.y;
+      }
+    });
+
+    renderAllCanvases();
   };
 
   // 1. Initialize Map, Player Team & Opponents
@@ -281,9 +306,10 @@ export default function App() {
         minZoom: 10,
         zoomControl: false,
         zoomAnimation: true,
-        zoomAnimationDuration: 0.15,
-        wheelDebounceTime: 15,
-        wheelPxPerZoomLevel: 90,
+        zoomAnimationDuration: 1,
+        wheelDebounceTime: 60,
+        zoomDelta: 0.2,
+        wheelPxPerZoomLevel: 120,
       }).setView([22.3193, 114.1694], 12);
 
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -292,55 +318,19 @@ export default function App() {
         attribution: "© OpenStreetMap",
       }).addTo(map);
 
-      const canvasRenderer = L.canvas({ padding: 0.5 });
+      // Dedicated Canvas for static background opponents
+      const opponentCanvasRenderer = L.canvas({ padding: 0.5, tolerance: 0 });
 
-      // Controllable Player Units (Crimson Red)
+      // Player Unit Emoji Markers (DOM layer zIndex: 600)
       dotsRef.current.forEach((dot) => {
-        const dotOuter = L.circle(dot.pos, {
-          renderer: canvasRenderer,
-          radius: dot.radius,
-          color: OUR_TEAM_COLOR,
-          weight: 1,
-          fillColor: OUR_TEAM_COLOR,
-          fillOpacity: 0.25,
-          interactive: false,
-        }).addTo(map);
-
         const dotEmoji = L.marker(dot.pos, {
           icon: getPrebakedEmojiIcon(dot.symbol, OUR_TEAM_COLOR, false, 1.0),
           interactive: false,
         }).addTo(map);
 
-        const landPath = L.polyline([], {
-          renderer: canvasRenderer,
-          color: "#1e824c",
-          weight: 5,
-          opacity: 0.55,
-          interactive: false,
-        }).addTo(map);
-
-        const waterPath = L.polyline([], {
-          renderer: canvasRenderer,
-          color: "#0077be",
-          weight: 5,
-          opacity: 0.55,
-          interactive: false,
-        }).addTo(map);
-
-        const hollowDest = L.circle([0, 0], {
-          renderer: canvasRenderer,
-          radius: 15,
-          color: OUR_TEAM_COLOR,
-          weight: 2,
-          dashArray: "6, 6",
-          fill: false,
-          interactive: false,
-        }).addTo(map);
-
-        dot.layers = { dotOuter, dotEmoji, landPath, waterPath, hollowDest };
+        dot.layers = { dotEmoji };
       });
 
-      // Handle dynamic mobile navigation bar collapsing/expanding
       const handleViewportResize = () => {
         map.invalidateSize({ animate: false });
         syncCanvasSize();
@@ -351,29 +341,12 @@ export default function App() {
         window.visualViewport.addEventListener("resize", handleViewportResize);
       }
 
-      // Initial buffer calibration
       syncCanvasSize();
 
-      // Keep fog attached to the map continuously during zoom and pan
-      map.on("zoom", drawFog);
-      map.on("move", drawFog);
-
-      map.on("zoomstart", () => {
-        isZoomingRef.current = true;
-      });
-
-      map.on("zoomend", () => {
-        isZoomingRef.current = false;
-        dotsRef.current.forEach((dot) => {
-          dot.layers.dotOuter.setLatLng(dot.pos);
-          dot.layers.dotEmoji.setLatLng(dot.pos);
-
-          const { landMulti, waterMulti } = buildPathSegments(dot);
-          dot.layers.landPath.setLatLngs(landMulti);
-          dot.layers.waterPath.setLatLngs(waterMulti);
-        });
-        syncCanvasSize();
-      });
+      // Continuous direct frame synchronization on zoom & pan
+      map.on("zoom", renderAllCanvases);
+      map.on("move", renderAllCanvases);
+      map.on("zoomend", syncCanvasSize);
 
       mapRef.current = map;
 
@@ -383,7 +356,6 @@ export default function App() {
           defaultBboxRef.current = bbox;
           map.fitBounds(bbox);
 
-          // 1. Scatter our 4 controllable characters
           const playerSnapPromises = dotsRef.current.map(() => {
             const randLat = bbox[0][0] + Math.random() * (bbox[1][0] - bbox[0][0]);
             const randLon = bbox[0][1] + Math.random() * (bbox[1][1] - bbox[0][1]);
@@ -394,13 +366,12 @@ export default function App() {
           playerSnaps.forEach((res, i) => {
             const dot = dotsRef.current[i];
             dot.pos = res.pt;
-            dot.layers.dotOuter.setLatLng(res.pt);
             dot.layers.dotEmoji.setLatLng(res.pt);
           });
 
           syncCanvasSize();
 
-          // 2. Scatter remaining 44 characters (Teams 2 to 12)
+          // 44 background opponent characters
           const opponentPromises = [];
           for (let teamIdx = 1; teamIdx < TEAM_COLORS.length; teamIdx++) {
             const teamColor = TEAM_COLORS[teamIdx];
@@ -420,7 +391,7 @@ export default function App() {
           const opponentUnits = await Promise.all(opponentPromises);
           opponentUnits.forEach(({ pt, symbol, teamColor }) => {
             L.circle(pt, {
-              renderer: canvasRenderer,
+              renderer: opponentCanvasRenderer,
               radius: 25,
               color: teamColor,
               weight: 1,
@@ -456,11 +427,6 @@ export default function App() {
     const loop = (now) => {
       const dt = (now - lastTime) / 1000.0;
       lastTime = now;
-
-      const map = mapRef.current;
-      const isZooming =
-        isZoomingRef.current ||
-        Boolean(map && (map._animatingZoom || map._zooming || (map.touchZoom && map.touchZoom._zooming)));
 
       dotsRef.current.forEach((dot) => {
         const { state, waypoints, layers } = dot;
@@ -504,13 +470,6 @@ export default function App() {
 
           layers.dotEmoji.setLatLng(dot.pos);
 
-          if (!isZooming) {
-            layers.dotOuter.setLatLng(dot.pos);
-            const { landMulti, waterMulti } = buildPathSegments(dot);
-            layers.landPath.setLatLngs(landMulti);
-            layers.waterPath.setLatLngs(waterMulti);
-          }
-
           if (state !== "Redirecting") {
             const isWater = dot.waterFlags[segIdx] === 1;
             dot.state = isWater ? "Ferry" : "Move";
@@ -519,8 +478,6 @@ export default function App() {
           if (segIdx >= waypoints.length - 1) {
             dot.state = "Stop";
             dot.waypoints = [];
-            layers.landPath.setLatLngs([]);
-            layers.waterPath.setLatLngs([]);
             dot.timeLeft = "--";
             dot.eta = "--";
             dot.distLeft = "--";
@@ -538,8 +495,7 @@ export default function App() {
         }
       });
 
-      // Continuously redraw fog vision holes along moving units
-      drawFog();
+      renderAllCanvases();
 
       if (now - lastUIUpdate > 100) {
         setDotsUI(
@@ -629,8 +585,6 @@ export default function App() {
         dot.state = "Redirecting";
 
         const snapC = await snap(clickLat, clickLon);
-        dot.layers.hollowDest.setLatLng(snapC.pt);
-
         const snapB = await snap(nodeBCoord[0], nodeBCoord[1]);
         const { flatPolyline: bToCFlat, waterFlags: bToCFlags } = await pathfind(snapB, snapC);
 
@@ -659,10 +613,6 @@ export default function App() {
         dot.pos = newWaypoints[0];
         dot.ferryTarget = null;
 
-        const { landMulti, waterMulti } = buildPathSegments(dot);
-        dot.layers.landPath.setLatLngs(landMulti);
-        dot.layers.waterPath.setLatLngs(waterMulti);
-
         dot.nextAllowedClick = performance.now() + 200;
         dot.state = newFlags[0] === 1 ? "Ferry" : "Move";
       } else {
@@ -670,8 +620,6 @@ export default function App() {
 
         const startPos = dot.pos;
         const snapC = await snap(clickLat, clickLon);
-        dot.layers.hollowDest.setLatLng(snapC.pt);
-
         const snapStart = await snap(startPos[0], startPos[1]);
         const { flatPolyline, waterFlags } = await pathfind(snapStart, snapC);
 
@@ -685,16 +633,13 @@ export default function App() {
         dot.segIdx = 0;
         dot.pos = newWaypoints[0];
 
-        dot.layers.dotOuter.setLatLng(dot.pos);
         dot.layers.dotEmoji.setLatLng(dot.pos);
-
-        const { landMulti, waterMulti } = buildPathSegments(dot);
-        dot.layers.landPath.setLatLngs(landMulti);
-        dot.layers.waterPath.setLatLngs(waterMulti);
 
         dot.nextAllowedClick = performance.now() + 200;
         dot.state = waterFlags[0] === 1 ? "Ferry" : "Move";
       }
+
+      renderAllCanvases();
     };
 
     const map = mapRef.current;
@@ -712,10 +657,8 @@ export default function App() {
   const handleAddRadius = (id, e) => {
     e.stopPropagation();
     const dot = dotsRef.current[id];
-    if (dot) {
-      dot.radius += 10;
-      if (dot.layers.dotOuter) dot.layers.dotOuter.setRadius(dot.radius);
-    }
+    if (dot) dot.radius += 10;
+    renderAllCanvases();
   };
 
   const handleTeleport = (id, e) => {
@@ -726,10 +669,7 @@ export default function App() {
     const destCoord = dot.waypoints[dot.waypoints.length - 1];
     dot.pos = destCoord;
 
-    if (dot.layers.dotOuter) dot.layers.dotOuter.setLatLng(destCoord);
     if (dot.layers.dotEmoji) dot.layers.dotEmoji.setLatLng(destCoord);
-    if (dot.layers.landPath) dot.layers.landPath.setLatLngs([]);
-    if (dot.layers.waterPath) dot.layers.waterPath.setLatLngs([]);
 
     dot.waypoints = [];
     dot.waterFlags = [];
@@ -740,7 +680,7 @@ export default function App() {
     dot.eta = "--";
     dot.distLeft = "--";
 
-    drawFog();
+    renderAllCanvases();
   };
 
   const selectedDotUI = dotsUI.find((d) => d.id === selectedId);
@@ -751,21 +691,29 @@ export default function App() {
         position: "fixed",
         top: 0,
         left: 0,
-        width: "100vw",
         width: "100dvw",
-        height: "100vh",
-        height: "100dvh", // Automatically tracks mobile dynamic URL bar and bottom nav
+        height: "100dvh",
         margin: 0,
         padding: 0,
         overflow: "hidden",
-        overscrollBehavior: "none", // Prevents mobile pull-to-refresh & rubber-banding
+        overscrollBehavior: "none",
       }}
     >
-      {/* 
-        High-Performance 2D Canvas Fog of War Layer (zIndex: 450)
-        - Locked to map.getSize() so the hole is perfectly centered on the emoji on mobile
-        - Redrawn continuously across zoom and pan
-      */}
+      {/* Layer 1: Dynamic Paths & Unit Circles (zIndex: 420) */}
+      <canvas
+        ref={pathsCanvasRef}
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          width: "100%",
+          height: "100%",
+          pointerEvents: "none",
+          zIndex: 420,
+        }}
+      />
+
+      {/* Layer 2: Tactical Fog of War (zIndex: 450) */}
       <canvas
         ref={fogCanvasRef}
         style={{
@@ -779,7 +727,7 @@ export default function App() {
         }}
       />
 
-      {/* 4 White Circle Buttons on Bottom-Left in a Vertical Line */}
+      {/* 4 Bottom-Left Unit Buttons (zIndex: 1000) */}
       <div
         style={{
           position: "absolute",
@@ -824,7 +772,7 @@ export default function App() {
         })}
       </div>
 
-      {/* Slide-Up Popup Panel (Connected to Bottom, accommodates safe area on iPhone) */}
+      {/* Slide-Up Bottom UI Panel (zIndex: 999) */}
       <div
         style={{
           position: "absolute",
@@ -852,7 +800,6 @@ export default function App() {
       >
         {selectedDotUI && (
           <>
-            {/* Identity & State */}
             <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
               <span style={{ fontSize: "24px" }}>{selectedDotUI.symbol}</span>
               <div>
@@ -875,7 +822,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Telemetry Stats */}
             <div style={{ display: "flex", gap: "14px", alignItems: "center" }}>
               <div style={{ fontSize: "12px", color: "#333" }}>
                 <span style={{ fontSize: "10px", color: "#888", display: "block" }}>ETA</span>
@@ -899,7 +845,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Actions: Modifiers & Hide Button */}
             <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
               <button
                 onClick={(e) => handleAddSpeed(selectedDotUI.id, e)}
