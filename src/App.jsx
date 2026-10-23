@@ -52,31 +52,27 @@ function getMetersToPixels(map, lat, meters) {
   return meters / metersPerPx;
 }
 
-// In-memory icon texture cache
-const iconTextureCache = new Map();
+// In-memory offscreen canvas cache for blazing-fast 2D canvas blitting
+const emojiCanvasCache = new Map();
 
-function getPrebakedEmojiIcon(symbol, color = OUR_TEAM_COLOR, isStrongGlow = false, opacity = 1.0) {
-  const cacheKey = `${symbol}_${color}_${isStrongGlow}_${opacity}`;
-  if (iconTextureCache.has(cacheKey)) {
-    return iconTextureCache.get(cacheKey);
+function getPrebakedCanvasTexture(symbol, color = OUR_TEAM_COLOR, isStrongGlow = false) {
+  const cacheKey = `${symbol}_${color}_${isStrongGlow}`;
+  if (emojiCanvasCache.has(cacheKey)) {
+    return emojiCanvasCache.get(cacheKey);
   }
 
   const displaySize = isStrongGlow ? 48 : 40;
-  const scale = 2;
+  const scale = window.devicePixelRatio || 2;
   const canvasSize = displaySize * scale;
 
   const canvas = document.createElement("canvas");
   canvas.width = canvasSize;
   canvas.height = canvasSize;
   const ctx = canvas.getContext("2d");
-
   const center = canvasSize / 2;
 
-  ctx.save();
-  ctx.globalAlpha = opacity;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-
   const fontSize = isStrongGlow ? 22 * scale : 19 * scale;
   ctx.font = `${fontSize}px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif`;
 
@@ -85,38 +81,21 @@ function getPrebakedEmojiIcon(symbol, color = OUR_TEAM_COLOR, isStrongGlow = fal
     ctx.shadowBlur = 18 * scale;
     ctx.fillText(symbol, center, center);
 
-    ctx.shadowColor = "#ffffff";
-    ctx.shadowBlur = 10 * scale;
-    ctx.fillText(symbol, center, center);
-
     ctx.shadowColor = color;
-    ctx.shadowBlur = 6 * scale;
-    ctx.fillText(symbol, center, center);
+    ctx.shadowBlur = 8 * scale;
     ctx.fillText(symbol, center, center);
   } else {
     ctx.shadowColor = color;
-    ctx.shadowBlur = 12 * scale;
-    ctx.fillText(symbol, center, center);
-
-    ctx.shadowBlur = 6 * scale;
-    ctx.fillText(symbol, center, center);
-
-    ctx.shadowBlur = 3 * scale;
+    ctx.shadowBlur = 8 * scale;
     ctx.fillText(symbol, center, center);
   }
 
   ctx.shadowBlur = 0;
   ctx.fillText(symbol, center, center);
-  ctx.restore();
 
-  const icon = L.icon({
-    iconUrl: canvas.toDataURL("image/png"),
-    iconSize: [displaySize, displaySize],
-    iconAnchor: [displaySize / 2, displaySize / 2],
-  });
-
-  iconTextureCache.set(cacheKey, icon);
-  return icon;
+  const textureRecord = { canvas, displaySize };
+  emojiCanvasCache.set(cacheKey, textureRecord);
+  return textureRecord;
 }
 
 export default function App() {
@@ -164,13 +143,10 @@ export default function App() {
       redirectStart: 0,
       ferryTarget: null,
       distLeft: "--",
-      layers: {
-        dotEmoji: null,
-      },
     }))
   );
 
-  // 1. Draw Paths, Hollow Destination, & Unit Ground Circles onto Screen Canvas (zIndex: 420)
+  // 1. Draw Paths, Unit Circles, & Emojis on the SAME Canvas (Zero Glitch / Zero Lag)
   const drawDynamicElements = () => {
     const map = mapRef.current;
     const canvas = pathsCanvasRef.current;
@@ -182,7 +158,7 @@ export default function App() {
 
     ctx.clearRect(0, 0, width, height);
 
-    // Pass A: Render Planned Land / Ferry Paths & Hollow Destination Rings
+    // Pass A: Render Planned Land / Ferry Paths
     ctx.save();
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
@@ -191,21 +167,20 @@ export default function App() {
       const { waypoints, waterFlags, segIdx, pos, radius } = dot;
       if (!waypoints || waypoints.length <= 1 || segIdx >= waypoints.length - 1) return;
 
-      // Draw all upcoming segments starting from unit's live coordinate
       for (let i = segIdx; i < waypoints.length - 1; i++) {
         const isWater = waterFlags[i] === 1;
         const startPt = i === segIdx ? map.latLngToContainerPoint(pos) : map.latLngToContainerPoint(waypoints[i]);
         const endPt = map.latLngToContainerPoint(waypoints[i + 1]);
 
         ctx.beginPath();
-        ctx.strokeStyle = isWater ? "rgba(0, 119, 190, 0.65)" : "rgba(30, 130, 76, 0.65)";
+        ctx.strokeStyle = isWater ? "rgba(0, 119, 190, 0.7)" : "rgba(30, 130, 76, 0.7)";
         ctx.lineWidth = 5;
         ctx.moveTo(startPt.x, startPt.y);
         ctx.lineTo(endPt.x, endPt.y);
         ctx.stroke();
       }
 
-      // Draw hollow target ring matching unit's outer radius in meters
+      // Hollow target ring at destination matching unit radius in meters
       const dest = waypoints[waypoints.length - 1];
       const destPt = map.latLngToContainerPoint(dest);
       const destRadiusPx = getMetersToPixels(map, dest[0], radius);
@@ -231,12 +206,29 @@ export default function App() {
       if (radiusPx > 0) {
         ctx.beginPath();
         ctx.arc(pt.x, pt.y, radiusPx, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(213, 0, 0, 0.25)";
+        ctx.fillStyle = "rgba(213, 0, 0, 0.22)";
         ctx.fill();
         ctx.strokeStyle = OUR_TEAM_COLOR;
         ctx.lineWidth = 1.5;
         ctx.stroke();
       }
+    });
+    ctx.restore();
+
+    // Pass C: Render Emojis directly on Canvas (guarantees 100% attachment to circle & path)
+    ctx.save();
+    dotsRef.current.forEach((dot) => {
+      const pt = map.latLngToContainerPoint(dot.pos);
+      const isSelected = dot.id === selectedIdRef.current;
+      const { canvas: texCanvas, displaySize } = getPrebakedCanvasTexture(dot.symbol, OUR_TEAM_COLOR, isSelected);
+
+      ctx.drawImage(
+        texCanvas,
+        pt.x - displaySize / 2,
+        pt.y - displaySize / 2,
+        displaySize,
+        displaySize
+      );
     });
     ctx.restore();
   };
@@ -283,11 +275,6 @@ export default function App() {
     ctx.globalCompositeOperation = "source-over";
   };
 
-  const renderAllCanvases = () => {
-    drawDynamicElements();
-    drawFog();
-  };
-
   const syncCanvasSize = () => {
     const map = mapRef.current;
     if (!map) return;
@@ -299,19 +286,17 @@ export default function App() {
         cv.height = size.y;
       }
     });
-
-    renderAllCanvases();
   };
 
-  // 1. Initialize Map, Player Team & Opponents
+  // 1. Initialize Map, Background Opponents & Viewport Sync
   useEffect(() => {
     if (!mapRef.current) {
       const map = L.map(mapContainerRef.current, {
         minZoom: 10,
         zoomControl: false,
-        // Requested settings:
+        // Smooth, instantaneous tactical zoom without matrix tearing
         zoomAnimation: true,
-        zoomAnimationDuration: 0,
+        zoomAnimationDuration: 0.08,
         zoomSnap: 0.25,
         zoomDelta: 0.25,
         wheelPxPerZoomLevel: 90,
@@ -323,18 +308,7 @@ export default function App() {
         attribution: "© OpenStreetMap",
       }).addTo(map);
 
-      // Dedicated Canvas for static background opponents
       const opponentCanvasRenderer = L.canvas({ padding: 0.5, tolerance: 0 });
-
-      // Player Unit Emoji Markers (DOM layer zIndex: 600)
-      dotsRef.current.forEach((dot) => {
-        const dotEmoji = L.marker(dot.pos, {
-          icon: getPrebakedEmojiIcon(dot.symbol, OUR_TEAM_COLOR, false, 1.0),
-          interactive: false,
-        }).addTo(map);
-
-        dot.layers = { dotEmoji };
-      });
 
       const handleViewportResize = () => {
         map.invalidateSize({ animate: false });
@@ -348,24 +322,18 @@ export default function App() {
 
       syncCanvasSize();
 
-      // Continuous direct frame synchronization on zoom & pan
-      map.on("zoom", renderAllCanvases);
-      map.on("move", renderAllCanvases);
-      map.on("zoomend", () => {
-        dotsRef.current.forEach((d) => {
-          if (d.layers.dotEmoji) d.layers.dotEmoji.setLatLng(d.pos);
-        });
-        syncCanvasSize();
-      });
+      map.on("resize", syncCanvasSize);
+      map.on("zoomend", syncCanvasSize);
 
       mapRef.current = map;
 
-      // Scatter player and 44 opponents asynchronously
+      // Initialize Graph and Opponent Units
       initGraph()
         .then(async ({ bbox }) => {
           defaultBboxRef.current = bbox;
           map.fitBounds(bbox);
 
+          // Position our 4 player units
           const playerSnapPromises = dotsRef.current.map(() => {
             const randLat = bbox[0][0] + Math.random() * (bbox[1][0] - bbox[0][0]);
             const randLon = bbox[0][1] + Math.random() * (bbox[1][1] - bbox[0][1]);
@@ -374,14 +342,12 @@ export default function App() {
 
           const playerSnaps = await Promise.all(playerSnapPromises);
           playerSnaps.forEach((res, i) => {
-            const dot = dotsRef.current[i];
-            dot.pos = res.pt;
-            dot.layers.dotEmoji.setLatLng(res.pt);
+            dotsRef.current[i].pos = res.pt;
           });
 
           syncCanvasSize();
 
-          // 44 background opponent characters
+          // Opponent Units (Canvas background)
           const opponentPromises = [];
           for (let teamIdx = 1; teamIdx < TEAM_COLORS.length; teamIdx++) {
             const teamColor = TEAM_COLORS[teamIdx];
@@ -399,7 +365,7 @@ export default function App() {
           }
 
           const opponentUnits = await Promise.all(opponentPromises);
-          opponentUnits.forEach(({ pt, symbol, teamColor }) => {
+          opponentUnits.forEach(({ pt, teamColor }) => {
             L.circle(pt, {
               renderer: opponentCanvasRenderer,
               radius: 25,
@@ -408,11 +374,6 @@ export default function App() {
               opacity: 0.5,
               fillColor: teamColor,
               fillOpacity: 0.125,
-              interactive: false,
-            }).addTo(map);
-
-            L.marker(pt, {
-              icon: getPrebakedEmojiIcon(symbol, teamColor, false, 0.5),
               interactive: false,
             }).addTo(map);
           });
@@ -428,7 +389,7 @@ export default function App() {
     }
   }, []);
 
-  // 2. High-Performance Movement Engine (60 FPS)
+  // 2. Master Single Render Pipeline (60 FPS Game Loop)
   useEffect(() => {
     let animId;
     let lastTime = performance.now();
@@ -438,8 +399,9 @@ export default function App() {
       const dt = (now - lastTime) / 1000.0;
       lastTime = now;
 
+      // 1. Update Physics and Positions
       dotsRef.current.forEach((dot) => {
-        const { state, waypoints, layers } = dot;
+        const { state, waypoints } = dot;
         let segIdx = dot.segIdx;
 
         const isFerryRedirect = state === "Redirecting" && dot.ferryTarget !== null;
@@ -478,8 +440,6 @@ export default function App() {
             }
           }
 
-          layers.dotEmoji.setLatLng(dot.pos);
-
           if (state !== "Redirecting") {
             const isWater = dot.waterFlags[segIdx] === 1;
             dot.state = isWater ? "Ferry" : "Move";
@@ -505,8 +465,11 @@ export default function App() {
         }
       });
 
-      renderAllCanvases();
+      // 2. Render Single Consolidated Frame
+      drawDynamicElements();
+      drawFog();
 
+      // 3. UI Sync
       if (now - lastUIUpdate > 100) {
         setDotsUI(
           dotsRef.current.map((d) => ({
@@ -536,28 +499,17 @@ export default function App() {
     const map = mapRef.current;
     if (!map) return;
 
-    let nextSelectedId = null;
-
     if (selectedIdRef.current === id) {
       selectedIdRef.current = null;
       setSelectedId(null);
     } else {
-      nextSelectedId = id;
       selectedIdRef.current = id;
       setSelectedId(id);
       const dot = dotsRef.current[id];
       if (dot) {
-        map.panTo(dot.pos, { animate: true, duration: 0.6 });
+        map.panTo(dot.pos, { animate: true, duration: 0.4 });
       }
     }
-
-    dotsRef.current.forEach((d) => {
-      if (d.layers.dotEmoji) {
-        d.layers.dotEmoji.setIcon(
-          getPrebakedEmojiIcon(d.symbol, OUR_TEAM_COLOR, d.id === nextSelectedId, 1.0)
-        );
-      }
-    });
   };
 
   // 4. Targeted Map Click Rerouting
@@ -643,13 +595,9 @@ export default function App() {
         dot.segIdx = 0;
         dot.pos = newWaypoints[0];
 
-        dot.layers.dotEmoji.setLatLng(dot.pos);
-
         dot.nextAllowedClick = performance.now() + 200;
         dot.state = waterFlags[0] === 1 ? "Ferry" : "Move";
       }
-
-      renderAllCanvases();
     };
 
     const map = mapRef.current;
@@ -668,7 +616,6 @@ export default function App() {
     e.stopPropagation();
     const dot = dotsRef.current[id];
     if (dot) dot.radius += 10;
-    renderAllCanvases();
   };
 
   const handleTeleport = (id, e) => {
@@ -679,8 +626,6 @@ export default function App() {
     const destCoord = dot.waypoints[dot.waypoints.length - 1];
     dot.pos = destCoord;
 
-    if (dot.layers.dotEmoji) dot.layers.dotEmoji.setLatLng(destCoord);
-
     dot.waypoints = [];
     dot.waterFlags = [];
     dot.segIdx = 0;
@@ -689,8 +634,6 @@ export default function App() {
     dot.timeLeft = "--";
     dot.eta = "--";
     dot.distLeft = "--";
-
-    renderAllCanvases();
   };
 
   const selectedDotUI = dotsUI.find((d) => d.id === selectedId);
@@ -709,22 +652,7 @@ export default function App() {
         overscrollBehavior: "none",
       }}
     >
-      {/* 
-        CRITICAL OVERRIDE:
-        Disables CSS transition on Leaflet marker panes and animated layers.
-        This forces the DOM markers/emojis to snap immediately with 0 latency,
-        matching the instant redraw of the Canvas layers.
-      */}
-      <style>{`
-        .leaflet-zoom-anim .leaflet-zoom-animated,
-        .leaflet-marker-pane,
-        .leaflet-marker-icon {
-          transition: none !important;
-          -webkit-transition: none !important;
-        }
-      `}</style>
-
-      {/* Layer 1: Dynamic Paths, Hollow Destination, & Unit Circles (zIndex: 420) */}
+      {/* Dynamic Layer: Paths, Unit Circles, & Emojis (zIndex: 420) */}
       <canvas
         ref={pathsCanvasRef}
         style={{
@@ -738,7 +666,7 @@ export default function App() {
         }}
       />
 
-      {/* Layer 2: Tactical Fog of War (zIndex: 450) */}
+      {/* Dynamic Layer: Tactical Fog of War (zIndex: 450) */}
       <canvas
         ref={fogCanvasRef}
         style={{
