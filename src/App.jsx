@@ -502,10 +502,10 @@ export default function App() {
             }
           }
 
+          layers.dotEmoji.setLatLng(dot.pos);
+
           if (!isZooming) {
             layers.dotOuter.setLatLng(dot.pos);
-            layers.dotEmoji.setLatLng(dot.pos);
-
             const { landMulti, waterMulti } = buildPathSegments(dot);
             layers.landPath.setLatLngs(landMulti);
             layers.waterPath.setLatLngs(waterMulti);
