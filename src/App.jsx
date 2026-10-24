@@ -3,25 +3,48 @@ import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { initGraph, snap, pathfind } from "./fetch";
 
-const SATELLITE_STYLE = {
+const SATELLITE_TILES_URL =
+  "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
+const STREET_TILES_URL =
+  "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+
+// Base style hosting both satellite and standard street raster sources
+const BASE_STYLE = {
   version: 8,
   sources: {
     "satellite-tiles": {
       type: "raster",
-      tiles: [
-        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-      ],
+      tiles: [SATELLITE_TILES_URL],
+      tileSize: 256,
+      maxzoom: 19,
+    },
+    "street-tiles": {
+      type: "raster",
+      tiles: [STREET_TILES_URL],
       tileSize: 256,
       maxzoom: 19,
     },
   },
   layers: [
     {
+      id: "street-layer",
+      type: "raster",
+      source: "street-tiles",
+      minzoom: 0,
+      maxzoom: 22,
+      layout: {
+        visibility: "none",
+      },
+    },
+    {
       id: "satellite-layer",
       type: "raster",
       source: "satellite-tiles",
       minzoom: 0,
       maxzoom: 22,
+      layout: {
+        visibility: "visible",
+      },
     },
   ],
 };
@@ -246,6 +269,9 @@ export default function App() {
   const [selectedId, setSelectedId] = useState(null);
   const selectedIdRef = useRef(null);
 
+  // Basemap style toggle state: 'satellite' | 'street'
+  const [mapMode, setMapMode] = useState("satellite");
+
   // Recency stack of selected unit IDs (MRU at index 0)
   const selectionHistoryRef = useRef([]);
 
@@ -273,9 +299,9 @@ export default function App() {
       state: "Stop",
       speed: 20.0,
       radius: 25,
-      targetRadius: 25, // For smooth linear animation
+      targetRadius: 25,
       sightRadius: 600,
-      targetSightRadius: 600, // For smooth linear animation
+      targetSightRadius: 600,
       waypoints: [],
       waterFlags: [],
       segIdx: 0,
@@ -285,6 +311,22 @@ export default function App() {
       distLeft: "--",
     }))
   );
+
+  const toggleMapMode = () => {
+    const map = mapRef.current;
+    if (!map || !isMapReadyRef.current) return;
+
+    const nextMode = mapMode === "satellite" ? "street" : "satellite";
+    setMapMode(nextMode);
+
+    if (nextMode === "street") {
+      map.setLayoutProperty("satellite-layer", "visibility", "none");
+      map.setLayoutProperty("street-layer", "visibility", "visible");
+    } else {
+      map.setLayoutProperty("street-layer", "visibility", "none");
+      map.setLayoutProperty("satellite-layer", "visibility", "visible");
+    }
+  };
 
   // Synchronize dynamic GPU layers with game state in the same WebGL loop
   const syncMapGraphics = () => {
@@ -299,10 +341,8 @@ export default function App() {
     const activeSelectedId = selectedIdRef.current;
     const history = selectionHistoryRef.current;
 
-    // Helper to calculate stacking score: higher score = drawn later / on top
     const getUnitPriority = (id) => {
       if (id === activeSelectedId) return 100000;
-
       const historyIndex = history.indexOf(id);
       if (historyIndex !== -1) {
         return 5000 - historyIndex;
@@ -310,7 +350,6 @@ export default function App() {
       return INITIAL_PRIORITY[id];
     };
 
-    // Sort features ascending so highest priority is rendered last (drawn on top)
     const sortedDots = [...dotsRef.current].sort(
       (a, b) => getUnitPriority(a.id) - getUnitPriority(b.id)
     );
@@ -338,7 +377,6 @@ export default function App() {
           });
         }
 
-        // Destination target ring
         const dest = waypoints[waypoints.length - 1];
         ringFeatures.push({
           type: "Feature",
@@ -349,7 +387,6 @@ export default function App() {
         });
       }
 
-      // Friendly unit vision circle (WebGL Polygon) - using current animating radius
       visionFeatures.push({
         type: "Feature",
         geometry: {
@@ -358,7 +395,6 @@ export default function App() {
         },
       });
 
-      // Friendly unit icon (WebGL Symbol)
       unitFeatures.push({
         type: "Feature",
         geometry: {
@@ -405,7 +441,7 @@ export default function App() {
 
     const map = new MapConstructor({
       container: mapContainerRef.current,
-      style: SATELLITE_STYLE,
+      style: BASE_STYLE,
       center: [114.1694, 22.3193],
       zoom: 12,
       minZoom: 10,
@@ -418,13 +454,11 @@ export default function App() {
     map.on("load", () => {
       isMapReadyRef.current = true;
 
-      // Register both normal and selected emoji textures
       DOT_CONFIGS.forEach((cfg) => {
         map.addImage(`unit-icon-${cfg.id}-normal`, createEmojiImage(cfg.symbol, false));
         map.addImage(`unit-icon-${cfg.id}-selected`, createEmojiImage(cfg.symbol, true));
       });
 
-      // Opponents Source & Layer
       map.addSource("opponent-units", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -450,7 +484,6 @@ export default function App() {
         },
       });
 
-      // Unit Paths Source & Line Layer
       map.addSource("unit-paths", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -475,7 +508,6 @@ export default function App() {
         },
       });
 
-      // Destination Rings Layer
       map.addSource("dest-rings", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -492,7 +524,6 @@ export default function App() {
         },
       });
 
-      // Friendly Unit Vision Rings
       map.addSource("vision-circles", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -518,10 +549,8 @@ export default function App() {
         },
       });
 
-      // Add WebGL Fog Layer BEFORE the units layer so the emoji is NEVER dimmed
       map.addLayer(createFogLayer(dotsRef, unitsPlacedRef));
 
-      // Player Unit Emoji Icons (Drawn AFTER the fog, sorted by dynamic priority)
       map.addSource("player-units", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -545,7 +574,6 @@ export default function App() {
         },
       });
 
-      // Initialize Graph and Units
       initGraph()
         .then(async ({ bbox }) => {
           map.fitBounds(
@@ -568,7 +596,6 @@ export default function App() {
           });
           unitsPlacedRef.current = true;
 
-          // Opponents
           const opponentPromises = [];
           for (let teamIdx = 1; teamIdx < TEAM_COLORS.length; teamIdx++) {
             const teamColor = TEAM_COLORS[teamIdx];
@@ -614,7 +641,7 @@ export default function App() {
     };
   }, []);
 
-  // 2. High-Performance Movement & Smooth Radius Animation Game Loop
+  // 2. High-Performance Movement & Animation Game Loop
   useEffect(() => {
     let animId;
     let lastTime = performance.now();
@@ -625,22 +652,18 @@ export default function App() {
       lastTime = now;
 
       dotsRef.current.forEach((dot) => {
-        // --- Smooth linear radius animation ---
-        // Reach linear growth ( m/s)
         if (dot.radius < dot.targetRadius) {
           dot.radius = Math.min(dot.targetRadius, dot.radius + 100.0 * dt);
         } else if (dot.radius > dot.targetRadius) {
           dot.radius = Math.max(dot.targetRadius, dot.radius - 100.0 * dt);
         }
 
-        // Halo Sight linear growth (1000 m/s)
         if (dot.sightRadius < dot.targetSightRadius) {
           dot.sightRadius = Math.min(dot.targetSightRadius, dot.sightRadius + 1000.0 * dt);
         } else if (dot.sightRadius > dot.targetSightRadius) {
           dot.sightRadius = Math.max(dot.targetSightRadius, dot.sightRadius - 1000.0 * dt);
         }
 
-        // --- Movement Simulation ---
         const { state, waypoints } = dot;
         let segIdx = dot.segIdx;
 
@@ -705,10 +728,8 @@ export default function App() {
         }
       });
 
-      // Synchronously render paths, circles, and unit icons
       syncMapGraphics();
 
-      // UI throttle to 10 FPS
       if (now - lastUIUpdate > 100) {
         setDotsUI(
           dotsRef.current.map((d) => ({
@@ -745,7 +766,6 @@ export default function App() {
       selectedIdRef.current = id;
       setSelectedId(id);
 
-      // Push to front of LRU history
       const currentHistory = selectionHistoryRef.current.filter((item) => item !== id);
       selectionHistoryRef.current = [id, ...currentHistory];
 
@@ -950,7 +970,42 @@ export default function App() {
         }}
       />
 
-      {/* 2. Left-Hand Unit Selection Toolbar */}
+      {/* 2. Top-Left Basemap Toggle Button */}
+      <div
+        style={{
+          position: "absolute",
+          top: "calc(16px + env(safe-area-inset-top, 0px))",
+          left: 16,
+          zIndex: 40,
+        }}
+      >
+        <button
+          onClick={toggleMapMode}
+          style={{
+            backgroundColor: "#ffffff",
+            color: "#111827",
+            border: "1px solid rgba(0, 0, 0, 0.1)",
+            padding: "8px 14px",
+            borderRadius: "8px",
+            fontSize: "13px",
+            fontWeight: 600,
+            cursor: "pointer",
+            boxShadow: "0 2px 8px rgba(0, 0, 0, 0.2)",
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            userSelect: "none",
+            outline: "none",
+            transition: "all 0.15s ease",
+          }}
+          onMouseDown={(e) => (e.currentTarget.style.transform = "scale(0.97)")}
+          onMouseUp={(e) => (e.currentTarget.style.transform = "scale(1)")}
+        >
+          {mapMode === "satellite" ? "🗺️ Map View" : "🛰️ Satellite View"}
+        </button>
+      </div>
+
+      {/* 3. Left-Hand Unit Selection Toolbar */}
       <div
         style={{
           position: "absolute",
@@ -995,7 +1050,7 @@ export default function App() {
         })}
       </div>
 
-      {/* 3. Bottom Tactical Card */}
+      {/* 4. Bottom Tactical Card */}
       <div
         style={{
           position: "absolute",
