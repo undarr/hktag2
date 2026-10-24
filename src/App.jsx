@@ -8,7 +8,6 @@ const SATELLITE_TILES_URL =
 const STREET_TILES_URL =
   "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 
-// Base style hosting both satellite and standard street raster sources
 const BASE_STYLE = {
   version: 8,
   sources: {
@@ -57,8 +56,6 @@ const TEAM_COLORS = [
 
 const OUR_TEAM_COLOR = TEAM_COLORS[0];
 
-// Initial order when never selected:
-// Chopper (0, bottom) -> Cruiser (1) -> Officer (2) -> Runner (3, top)
 const INITIAL_PRIORITY = {
   2: 0, // Chopper
   1: 1, // Cruiser
@@ -91,7 +88,6 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Generate circular polygon GeoJSON for unit vision bounds & destinations
 function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 32) {
   const coords = [];
   const km = radiusMeters / 1000.0;
@@ -116,29 +112,36 @@ function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 32) {
   return coords;
 }
 
-// Pre-render unit emoji icons as canvas image textures with drop-shadows
+// Mobile-safe cross-platform emoji texture generator
 function createEmojiImage(symbol, isSelected) {
   const canvas = document.createElement("canvas");
   const size = 128;
   canvas.width = size;
   canvas.height = size;
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+  ctx.clearRect(0, 0, size, size);
 
   if (isSelected) {
-    ctx.filter = `drop-shadow(0 0 15px ${OUR_TEAM_COLOR}) drop-shadow(0 0 10px ${OUR_TEAM_COLOR}) drop-shadow(0 0 5px ${OUR_TEAM_COLOR})`;
+    ctx.filter = `drop-shadow(0 0 14px ${OUR_TEAM_COLOR}) drop-shadow(0 0 6px ${OUR_TEAM_COLOR})`;
   } else {
-    ctx.filter = `drop-shadow(0 0 6px ${OUR_TEAM_COLOR})`;
+    ctx.filter = `drop-shadow(0 0 5px ${OUR_TEAM_COLOR})`;
   }
 
-  ctx.font = "60px 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif";
+  ctx.font = "64px 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText(symbol, size / 2, size / 2);
 
-  return ctx.getImageData(0, 0, size, size);
+  const imgData = ctx.getImageData(0, 0, size, size);
+  return {
+    width: size,
+    height: size,
+    data: imgData.data,
+  };
 }
 
-// Custom WebGL Fog-of-War Layer
+// Mobile-optimized Fog-of-War Layer without pipeline breaking `discard`
 function createFogLayer(dotsRef, unitsPlacedRef) {
   return {
     id: "fog-of-war-layer",
@@ -157,7 +160,7 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
       `;
 
       const fragmentSource = `
-        precision highp float;
+        precision mediump float;
         uniform vec2 u_resolution;
         uniform vec2 u_centers[4];
         uniform float u_radii[4];
@@ -172,7 +175,7 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
           for (int i = 0; i < 4; i++) {
             if (i >= u_unit_count) break;
             float d = distance(fragCoord, u_centers[i]);
-            float rInner = u_radii[i] * (400.0 / 600.0);
+            float rInner = u_radii[i] * 0.6667;
             float rOuter = u_radii[i];
 
             if (d < rInner) {
@@ -183,9 +186,7 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
             }
           }
 
-          if (minFog <= 0.0) {
-            discard;
-          }
+          // Do NOT discard on mobile GPUs to avoid corrupting MapLibre's stencil/depth pipeline
           gl_FragColor = vec4(0.027, 0.054, 0.090, minFog);
         }
       `;
@@ -256,6 +257,9 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
       gl.vertexAttribPointer(this.aPos, 2, gl.FLOAT, false, 0, 0);
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      // Reset buffer to prevent leaking into MapLibre symbol render loops
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
     },
   };
 }
@@ -268,11 +272,8 @@ export default function App() {
 
   const [selectedId, setSelectedId] = useState(null);
   const selectedIdRef = useRef(null);
-
-  // Basemap style toggle state: 'satellite' | 'street'
   const [mapMode, setMapMode] = useState("satellite");
 
-  // Recency stack of selected unit IDs (MRU at index 0)
   const selectionHistoryRef = useRef([]);
 
   const [dotsUI, setDotsUI] = useState(
@@ -328,7 +329,6 @@ export default function App() {
     }
   };
 
-  // Synchronize dynamic GPU layers with game state in the same WebGL loop
   const syncMapGraphics = () => {
     const map = mapRef.current;
     if (!map || !isMapReadyRef.current) return;
@@ -359,7 +359,6 @@ export default function App() {
       const isSelected = id === activeSelectedId;
       const priority = getUnitPriority(id);
 
-      // Active path lines
       if (waypoints && waypoints.length > 1 && segIdx < waypoints.length - 1) {
         for (let i = segIdx; i < waypoints.length - 1; i++) {
           const start = i === segIdx ? [pos[1], pos[0]] : [waypoints[i][1], waypoints[i][0]];
@@ -433,7 +432,6 @@ export default function App() {
     map.triggerRepaint();
   };
 
-  // 1. Initialize MapLibre
   useEffect(() => {
     if (!mapContainerRef.current) return;
 
@@ -454,9 +452,12 @@ export default function App() {
     map.on("load", () => {
       isMapReadyRef.current = true;
 
+      // Register both normal and selected emoji textures safely with pixel ratios
       DOT_CONFIGS.forEach((cfg) => {
-        map.addImage(`unit-icon-${cfg.id}-normal`, createEmojiImage(cfg.symbol, false));
-        map.addImage(`unit-icon-${cfg.id}-selected`, createEmojiImage(cfg.symbol, true));
+        const normalImg = createEmojiImage(cfg.symbol, false);
+        const selectedImg = createEmojiImage(cfg.symbol, true);
+        map.addImage(`unit-icon-${cfg.id}-normal`, normalImg, { pixelRatio: 2 });
+        map.addImage(`unit-icon-${cfg.id}-selected`, selectedImg, { pixelRatio: 2 });
       });
 
       map.addSource("opponent-units", {
@@ -549,8 +550,10 @@ export default function App() {
         },
       });
 
+      // Fog layer
       map.addLayer(createFogLayer(dotsRef, unitsPlacedRef));
 
+      // Player Unit Emoji Icons
       map.addSource("player-units", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -565,8 +568,8 @@ export default function App() {
           "icon-size": [
             "case",
             ["==", ["get", "isSelected"], true],
-            0.45 * 1.1,
-            0.45,
+            0.55,
+            0.48,
           ],
           "icon-allow-overlap": true,
           "icon-ignore-placement": true,
@@ -641,7 +644,6 @@ export default function App() {
     };
   }, []);
 
-  // 2. High-Performance Movement & Animation Game Loop
   useEffect(() => {
     let animId;
     let lastTime = performance.now();
@@ -778,7 +780,6 @@ export default function App() {
     syncMapGraphics();
   };
 
-  // Map Click Rerouting
   useEffect(() => {
     if (!mapRef.current) return;
 
@@ -950,7 +951,8 @@ export default function App() {
         top: 0,
         left: 0,
         width: "100vw",
-        height: "100vh",
+        height: "100vh", // Fallback for older browsers
+        height: "100dvh",
         margin: 0,
         padding: 0,
         overflow: "hidden",
@@ -990,16 +992,14 @@ export default function App() {
             fontSize: "13px",
             fontWeight: 600,
             cursor: "pointer",
-            boxShadow: "0 2px 8px rgba(0, 0, 0, 0.2)",
+            boxShadow: "0 2px 8px rgba(0, 0, 0, 0.25)",
             display: "flex",
             alignItems: "center",
             gap: "6px",
             userSelect: "none",
             outline: "none",
-            transition: "all 0.15s ease",
+            WebkitTapHighlightColor: "transparent",
           }}
-          onMouseDown={(e) => (e.currentTarget.style.transform = "scale(0.97)")}
-          onMouseUp={(e) => (e.currentTarget.style.transform = "scale(1)")}
         >
           {mapMode === "satellite" ? "🗺️ Map View" : "🛰️ Satellite View"}
         </button>
@@ -1042,6 +1042,7 @@ export default function App() {
                 outline: "none",
                 userSelect: "none",
                 padding: 0,
+                WebkitTapHighlightColor: "transparent",
               }}
             >
               {dot.symbol}
@@ -1070,10 +1071,12 @@ export default function App() {
           alignItems: "center",
           justifyContent: "space-between",
           flexWrap: "wrap",
-          gap: "12px",
+          gap: "10px",
           transform: selectedDotUI ? "translateY(0)" : "translateY(110%)",
           transition: "transform 0.3s cubic-bezier(0.16, 1, 0.3, 1)",
           pointerEvents: selectedDotUI ? "auto" : "none",
+          maxHeight: "80dvh",
+          overflowY: "auto",
         }}
       >
         {selectedDotUI && (
@@ -1100,17 +1103,17 @@ export default function App() {
               </div>
             </div>
 
-            <div style={{ display: "flex", gap: "14px", alignItems: "center" }}>
+            <div style={{ display: "flex", gap: "12px", alignItems: "center", flexWrap: "wrap" }}>
               <div style={{ fontSize: "12px", color: "#333" }}>
                 <span style={{ fontSize: "10px", color: "#888", display: "block" }}>ETA</span>
                 <b>{selectedDotUI.eta}</b>
               </div>
               <div style={{ fontSize: "12px", color: "#333" }}>
-                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Time Left</span>
+                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Time</span>
                 <b>{selectedDotUI.timeLeft}</b>
               </div>
               <div style={{ fontSize: "12px", color: "#333" }}>
-                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Distance</span>
+                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Dist</span>
                 <b>{selectedDotUI.distLeft}</b>
               </div>
               <div style={{ fontSize: "12px", color: "#333" }}>
@@ -1122,16 +1125,16 @@ export default function App() {
                 <b>{selectedDotUI.radius} m</b>
               </div>
               <div style={{ fontSize: "12px", color: "#333" }}>
-                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Halo Sight</span>
+                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Sight</span>
                 <b>{selectedDotUI.sightRadius} m</b>
               </div>
             </div>
 
-            <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+            <div style={{ display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" }}>
               <button
                 onClick={(e) => handleStop(selectedDotUI.id, e)}
                 style={{
-                  padding: "5px 10px",
+                  padding: "6px 10px",
                   background: "#dc3545",
                   color: "#fff",
                   border: "none",
@@ -1146,7 +1149,7 @@ export default function App() {
               <button
                 onClick={(e) => handleAddSpeed(selectedDotUI.id, e)}
                 style={{
-                  padding: "5px 10px",
+                  padding: "6px 10px",
                   background: "#0d6efd",
                   color: "#fff",
                   border: "none",
@@ -1161,7 +1164,7 @@ export default function App() {
               <button
                 onClick={(e) => handleAddReach(selectedDotUI.id, e)}
                 style={{
-                  padding: "5px 10px",
+                  padding: "6px 10px",
                   background: "#0dcaf0",
                   color: "#000",
                   border: "none",
@@ -1176,7 +1179,7 @@ export default function App() {
               <button
                 onClick={(e) => handleAddSight(selectedDotUI.id, e)}
                 style={{
-                  padding: "5px 10px",
+                  padding: "6px 10px",
                   background: "#ffc107",
                   color: "#000",
                   border: "none",
@@ -1191,7 +1194,7 @@ export default function App() {
               <button
                 onClick={(e) => handleTeleport(selectedDotUI.id, e)}
                 style={{
-                  padding: "5px 10px",
+                  padding: "6px 10px",
                   background: "#6f42c1",
                   color: "#fff",
                   border: "none",
@@ -1206,7 +1209,7 @@ export default function App() {
               <button
                 onClick={() => handleToggleSelect(selectedDotUI.id)}
                 style={{
-                  padding: "5px 12px",
+                  padding: "6px 12px",
                   background: "#e0e0e0",
                   color: "#333",
                   border: "none",
