@@ -88,6 +88,7 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// Strictly closed circular polygon GeoJSON
 function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 32) {
   const coords = [];
   const km = radiusMeters / 1000.0;
@@ -95,7 +96,7 @@ function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 32) {
   const cLat = (centerLat * Math.PI) / 180.0;
   const cLon = (centerLon * Math.PI) / 180.0;
 
-  for (let i = 0; i <= points; i++) {
+  for (let i = 0; i < points; i++) {
     const bearing = (i * 2 * Math.PI) / points;
     const lat = Math.asin(
       Math.sin(cLat) * Math.cos(dRad) +
@@ -109,40 +110,54 @@ function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 32) {
       );
     coords.push([(lon * 180.0) / Math.PI, (lat * 180.0) / Math.PI]);
   }
+  // Guarantee exact closure for mobile GeoJSON parsers
+  coords.push(coords[0]);
   return coords;
 }
 
-// Mobile-safe cross-platform emoji texture generator
-function createEmojiImage(symbol, isSelected) {
-  const canvas = document.createElement("canvas");
-  const size = 128;
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+// Mobile Safari/WebKit-compatible emoji image generator using Image Elements
+function registerEmojiImages(map) {
+  const promises = [];
+  DOT_CONFIGS.forEach((cfg) => {
+    [false, true].forEach((isSelected) => {
+      const p = new Promise((resolve) => {
+        const canvas = document.createElement("canvas");
+        const size = 128;
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext("2d");
 
-  ctx.clearRect(0, 0, size, size);
+        ctx.clearRect(0, 0, size, size);
 
-  if (isSelected) {
-    ctx.filter = `drop-shadow(0 0 14px ${OUR_TEAM_COLOR}) drop-shadow(0 0 6px ${OUR_TEAM_COLOR})`;
-  } else {
-    ctx.filter = `drop-shadow(0 0 5px ${OUR_TEAM_COLOR})`;
-  }
+        if (isSelected) {
+          ctx.filter = `drop-shadow(0 0 12px ${OUR_TEAM_COLOR}) drop-shadow(0 0 6px ${OUR_TEAM_COLOR})`;
+        } else {
+          ctx.filter = `drop-shadow(0 0 4px ${OUR_TEAM_COLOR})`;
+        }
 
-  ctx.font = "64px 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(symbol, size / 2, size / 2);
+        ctx.font = "62px system-ui, -apple-system, sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(cfg.symbol, size / 2, size / 2);
 
-  const imgData = ctx.getImageData(0, 0, size, size);
-  return {
-    width: size,
-    height: size,
-    data: imgData.data,
-  };
+        const img = new Image();
+        img.onload = () => {
+          const imgName = `unit-icon-${cfg.id}-${isSelected ? "selected" : "normal"}`;
+          if (!map.hasImage(imgName)) {
+            map.addImage(imgName, img, { pixelRatio: 2 });
+          }
+          resolve();
+        };
+        img.src = canvas.toDataURL();
+      });
+      promises.push(p);
+    });
+  });
+  return Promise.all(promises);
 }
 
-// Mobile-optimized Fog-of-War Layer without pipeline breaking `discard`
-function createFogLayer(dotsRef, unitsPlacedRef) {
+// Mobile Safe Custom WebGL Fog-of-War Layer with complete state saving & restoration
+function createSafeFogLayer(dotsRef, unitsPlacedRef) {
   return {
     id: "fog-of-war-layer",
     type: "custom",
@@ -170,24 +185,23 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
           vec2 fragCoord = gl_FragCoord.xy;
           fragCoord.y = u_resolution.y - fragCoord.y;
 
-          float minFog = 0.72;
+          float minFog = 0.70;
 
           for (int i = 0; i < 4; i++) {
             if (i >= u_unit_count) break;
             float d = distance(fragCoord, u_centers[i]);
-            float rInner = u_radii[i] * 0.6667;
+            float rInner = u_radii[i] * 0.667;
             float rOuter = u_radii[i];
 
             if (d < rInner) {
               minFog = 0.0;
             } else if (d < rOuter) {
               float factor = (d - rInner) / (rOuter - rInner);
-              minFog = min(minFog, factor * 0.72);
+              minFog = min(minFog, factor * 0.70);
             }
           }
 
-          // Do NOT discard on mobile GPUs to avoid corrupting MapLibre's stencil/depth pipeline
-          gl_FragColor = vec4(0.027, 0.054, 0.090, minFog);
+          gl_FragColor = vec4(0.02, 0.04, 0.08, minFog);
         }
       `;
 
@@ -217,11 +231,20 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
         new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
         gl.STATIC_DRAW
       );
+      gl.bindBuffer(gl.ARRAY_BUFFER, null);
     },
 
     render(gl) {
       if (!unitsPlacedRef.current) return;
 
+      // 1. Snapshot previous WebGL context states
+      const prevProgram = gl.getParameter(gl.CURRENT_PROGRAM);
+      const prevBuffer = gl.getParameter(gl.ARRAY_BUFFER_BINDING);
+      const prevBlend = gl.isEnabled(gl.BLEND);
+      const prevBlendSrc = gl.getParameter(gl.BLEND_SRC_RGB);
+      const prevBlendDst = gl.getParameter(gl.BLEND_DST_RGB);
+
+      // 2. Execute custom shader
       gl.useProgram(this.program);
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -258,8 +281,12 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
 
       gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-      // Reset buffer to prevent leaking into MapLibre symbol render loops
-      gl.bindBuffer(gl.ARRAY_BUFFER, null);
+      // 3. Fully restore MapLibre's GL context state for subsequent vector/symbol rendering
+      gl.disableVertexAttribArray(this.aPos);
+      gl.bindBuffer(gl.ARRAY_BUFFER, prevBuffer);
+      gl.useProgram(prevProgram);
+      if (!prevBlend) gl.disable(gl.BLEND);
+      gl.blendFunc(prevBlendSrc, prevBlendDst);
     },
   };
 }
@@ -449,17 +476,12 @@ export default function App() {
 
     mapRef.current = map;
 
-    map.on("load", () => {
+    map.on("load", async () => {
+      // 1. Ensure all emoji textures are loaded first
+      await registerEmojiImages(map);
       isMapReadyRef.current = true;
 
-      // Register both normal and selected emoji textures safely with pixel ratios
-      DOT_CONFIGS.forEach((cfg) => {
-        const normalImg = createEmojiImage(cfg.symbol, false);
-        const selectedImg = createEmojiImage(cfg.symbol, true);
-        map.addImage(`unit-icon-${cfg.id}-normal`, normalImg, { pixelRatio: 2 });
-        map.addImage(`unit-icon-${cfg.id}-selected`, selectedImg, { pixelRatio: 2 });
-      });
-
+      // 2. Opponent Units Layer
       map.addSource("opponent-units", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -485,6 +507,7 @@ export default function App() {
         },
       });
 
+      // 3. Unit Paths Layer
       map.addSource("unit-paths", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -509,6 +532,7 @@ export default function App() {
         },
       });
 
+      // 4. Destination Rings Layer
       map.addSource("dest-rings", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -525,6 +549,7 @@ export default function App() {
         },
       });
 
+      // 5. Friendly Unit Vision Circles
       map.addSource("vision-circles", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -550,10 +575,10 @@ export default function App() {
         },
       });
 
-      // Fog layer
-      map.addLayer(createFogLayer(dotsRef, unitsPlacedRef));
+      // 6. WebGL Fog Layer (with isolated state management)
+      map.addLayer(createSafeFogLayer(dotsRef, unitsPlacedRef));
 
-      // Player Unit Emoji Icons
+      // 7. Player Unit Emoji Icons
       map.addSource("player-units", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -577,6 +602,7 @@ export default function App() {
         },
       });
 
+      // 8. Initialize Graph & Units
       initGraph()
         .then(async ({ bbox }) => {
           map.fitBounds(
@@ -951,7 +977,7 @@ export default function App() {
         top: 0,
         left: 0,
         width: "100vw",
-        height: "100vh", // Fallback for older browsers
+        height: "100vh",
         height: "100dvh",
         margin: 0,
         padding: 0,
@@ -1061,6 +1087,7 @@ export default function App() {
           zIndex: 30,
           backgroundColor: "rgba(255, 255, 255, 0.95)",
           backdropFilter: "blur(8px)",
+          WebkitBackdropFilter: "blur(8px)",
           boxShadow: "0 -4px 16px rgba(0, 0, 0, 0.15)",
           borderTop: "1.5px solid #e0e0e0",
           borderTopLeftRadius: "16px",
