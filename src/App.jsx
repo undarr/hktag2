@@ -1,11 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
-import * as maplibregl from "maplibre-gl";
+import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { initGraph, snap, pathfind } from "./fetch";
-// 1. Tell Vite to bundle the .mjs worker as a separate asset URL
 import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?url";
 
-// 2. Pass that URL to MapLibre
 maplibregl.workerUrl = workerUrl;
 
 const SATELLITE_STYLE = {
