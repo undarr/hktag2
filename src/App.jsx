@@ -59,7 +59,7 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Generate circular polygon GeoJSON for unit vision bounds & destinations
+// Generate circular polygon GeoJSON for unit vision bounds / destinations
 function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 32) {
   const coords = [];
   const km = radiusMeters / 1000.0;
@@ -82,28 +82,6 @@ function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 32) {
     coords.push([(lon * 180.0) / Math.PI, (lat * 180.0) / Math.PI]);
   }
   return coords;
-}
-
-// Pre-render unit emoji icons as canvas image textures with the requested drop-shadows
-function createEmojiImage(symbol, isSelected) {
-  const canvas = document.createElement("canvas");
-  const size = 128;
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext("2d");
-
-  if (isSelected) {
-    ctx.filter = `drop-shadow(0 0 15px ${OUR_TEAM_COLOR}) drop-shadow(0 0 10px ${OUR_TEAM_COLOR}) drop-shadow(0 0 5px ${OUR_TEAM_COLOR})`;
-  } else {
-    ctx.filter = `drop-shadow(0 0 6px ${OUR_TEAM_COLOR})`;
-  }
-
-  ctx.font = "60px 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(symbol, size / 2, size / 2);
-
-  return ctx.getImageData(0, 0, size, size);
 }
 
 // Custom WebGL Fog-of-War Layer
@@ -133,9 +111,10 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
 
         void main() {
           vec2 fragCoord = gl_FragCoord.xy;
+          // Flip Y to match viewport coordinates
           fragCoord.y = u_resolution.y - fragCoord.y;
 
-          float minFog = 0.72;
+          float minFog = 0.72; // Fog opacity (alpha)
 
           for (int i = 0; i < 4; i++) {
             if (i >= u_unit_count) break;
@@ -177,6 +156,7 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
       this.uRadii = gl.getUniformLocation(prog, "u_radii[0]");
       this.uCount = gl.getUniformLocation(prog, "u_unit_count");
 
+      // Fullscreen quad
       this.vertexBuffer = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
       gl.bufferData(
@@ -206,6 +186,7 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
 
       dotsRef.current.forEach((dot) => {
         const pt = map.project([dot.pos[1], dot.pos[0]]);
+        // Multiply by devicePixelRatio for high-DPI screens
         const dpr = window.devicePixelRatio || 1;
         centers.push(pt.x * dpr, pt.y * dpr);
 
@@ -232,6 +213,7 @@ export default function App() {
   const mapRef = useRef(null);
   const isMapReadyRef = useRef(false);
   const unitsPlacedRef = useRef(false);
+  const markersRef = useRef(new Map());
 
   const [selectedId, setSelectedId] = useState(null);
   const selectedIdRef = useRef(null);
@@ -269,19 +251,26 @@ export default function App() {
     }))
   );
 
-  // Synchronize dynamic GPU layers with game state in the same WebGL loop
+  // Synchronize dynamic GPU layers with game state
   const syncMapGraphics = () => {
     const map = mapRef.current;
     if (!map || !isMapReadyRef.current) return;
 
+    // 1. Update native HTML Unit Markers
+    dotsRef.current.forEach((dot) => {
+      const marker = markersRef.current.get(dot.id);
+      if (marker) {
+        marker.setLngLat([dot.pos[1], dot.pos[0]]);
+      }
+    });
+
+    // 2. Build Paths & Destination Rings GeoJSON
     const lineFeatures = [];
     const ringFeatures = [];
     const visionFeatures = [];
-    const unitFeatures = [];
 
     dotsRef.current.forEach((dot) => {
-      const { waypoints, waterFlags, segIdx, pos, radius, id } = dot;
-      const isSelected = id === selectedIdRef.current;
+      const { waypoints, waterFlags, segIdx, pos, radius } = dot;
 
       // Active path lines
       if (waypoints && waypoints.length > 1 && segIdx < waypoints.length - 1) {
@@ -312,26 +301,12 @@ export default function App() {
         });
       }
 
-      // Friendly unit vision circle (WebGL Polygon)
+      // Friendly unit vision circle
       visionFeatures.push({
         type: "Feature",
         geometry: {
           type: "Polygon",
           coordinates: [createCircleGeoJSON(pos[0], pos[1], radius)],
-        },
-      });
-
-      // Friendly unit icon (WebGL Symbol)
-      unitFeatures.push({
-        type: "Feature",
-        geometry: {
-          type: "Point",
-          coordinates: [pos[1], pos[0]],
-        },
-        properties: {
-          id: dot.id,
-          icon: isSelected ? `unit-icon-${dot.id}-selected` : `unit-icon-${dot.id}-normal`,
-          isSelected,
         },
       });
     });
@@ -351,11 +326,7 @@ export default function App() {
       visionSource.setData({ type: "FeatureCollection", features: visionFeatures });
     }
 
-    const unitSource = map.getSource("player-units");
-    if (unitSource) {
-      unitSource.setData({ type: "FeatureCollection", features: unitFeatures });
-    }
-
+    // Force custom WebGL layer redraw
     map.triggerRepaint();
   };
 
@@ -379,12 +350,6 @@ export default function App() {
 
     map.on("load", () => {
       isMapReadyRef.current = true;
-
-      // Register both normal and selected emoji textures
-      DOT_CONFIGS.forEach((cfg) => {
-        map.addImage(`unit-icon-${cfg.id}-normal`, createEmojiImage(cfg.symbol, false));
-        map.addImage(`unit-icon-${cfg.id}-selected`, createEmojiImage(cfg.symbol, true));
-      });
 
       // Opponents Source & Layer
       map.addSource("opponent-units", {
@@ -412,7 +377,7 @@ export default function App() {
         },
       });
 
-      // Unit Paths Source & Line Layer
+      // Unit Paths Source & Line Layer (GPU-rendered)
       map.addSource("unit-paths", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
@@ -480,33 +445,33 @@ export default function App() {
         },
       });
 
-      // Player Unit Emoji Icons (Synchronized directly with WebGL layers)
-      map.addSource("player-units", {
-        type: "geojson",
-        data: { type: "FeatureCollection", features: [] },
-      });
-
-      map.addLayer({
-        id: "player-units-layer",
-        type: "symbol",
-        source: "player-units",
-        layout: {
-          "icon-image": ["get", "icon"],
-          "icon-size": [
-            "case",
-            ["==", ["get", "isSelected"], true],
-            0.45 * 1.3, // Scaled by 1.3 when selected
-            0.45,
-          ],
-          "icon-allow-overlap": true,
-          "icon-ignore-placement": true,
-        },
-      });
-
-      // Add WebGL Fog Layer
+      // Add Custom GPU Fog Layer
       map.addLayer(createFogLayer(dotsRef, unitsPlacedRef));
 
-      // Initialize Graph and Units
+      // Build Marker DOM nodes for player units
+      dotsRef.current.forEach((dot) => {
+        const el = document.createElement("div");
+        el.id = `marker-unit-${dot.id}`;
+        el.innerText = dot.symbol;
+        el.style.fontSize = "24px";
+        el.style.width = "40px";
+        el.style.height = "40px";
+        el.style.display = "flex";
+        el.style.alignItems = "center";
+        el.style.justifyContent = "center";
+        el.style.userSelect = "none";
+        el.style.filter = `drop-shadow(0 0 6px ${OUR_TEAM_COLOR})`;
+        el.style.cursor = "pointer";
+
+        const MarkerClass = maplibregl.Marker || maplibregl.default?.Marker;
+        const marker = new MarkerClass({ element: el })
+          .setLngLat([dot.pos[1], dot.pos[0]])
+          .addTo(map);
+
+        markersRef.current.set(dot.id, marker);
+      });
+
+      // Initialize Game Graph
       initGraph()
         .then(async ({ bbox }) => {
           map.fitBounds(
@@ -568,6 +533,8 @@ export default function App() {
     });
 
     return () => {
+      markersRef.current.forEach((m) => m.remove());
+      markersRef.current.clear();
       map.remove();
       mapRef.current = null;
       isMapReadyRef.current = false;
@@ -650,7 +617,7 @@ export default function App() {
         }
       });
 
-      // Synchronously render paths, circles, and unit icons
+      // Update WebGL Graphics and Markers
       syncMapGraphics();
 
       // UI throttle to 10 FPS
@@ -677,6 +644,19 @@ export default function App() {
     animId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animId);
   }, []);
+
+  // Update selected unit marker style
+  useEffect(() => {
+    markersRef.current.forEach((marker, id) => {
+      const el = marker.getElement();
+      if (id === selectedId) {
+        el.style.filter = "drop-shadow(0 0 10px #ffffff) drop-shadow(0 0 5px #D50000)";
+        el.style.transform += " scale(1.2)";
+      } else {
+        el.style.filter = `drop-shadow(0 0 6px ${OUR_TEAM_COLOR})`;
+      }
+    });
+  }, [selectedId]);
 
   const handleToggleSelect = (id) => {
     const map = mapRef.current;
@@ -834,7 +814,7 @@ export default function App() {
         backgroundColor: "#1a1a1a",
       }}
     >
-      {/* 1. Fully GPU-Accelerated WebGL Map */}
+      {/* 1. Hardware Accelerated MapLibre GL WebGL Map Container */}
       <div
         ref={mapContainerRef}
         style={{
