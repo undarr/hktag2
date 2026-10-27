@@ -20,7 +20,7 @@ const SATELLITE_STYLE = {
       id: "satellite-layer",
       type: "raster",
       source: "satellite-tiles",
-      minzoom: 0,
+      minzoom: 10,
       maxzoom: 22,
     },
   ],
@@ -108,7 +108,6 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
         uniform float u_radii[4];
         uniform int u_unit_count;
 
-        // Polynomial smooth maximum for organic gradient blending
         float smax(float a, float b, float k) {
           float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
           return mix(a, b, h) + k * h * (1.0 - h);
@@ -118,8 +117,6 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
           vec2 fragCoord = gl_FragCoord.xy;
           fragCoord.y = u_resolution.y - fragCoord.y;
 
-          // Pass 1: If inside the bright (inner) region of ANY halo, clear completely.
-          // The gradient of any other circle is not allowed to exist here.
           for (int i = 0; i < 4; i++) {
             if (i >= u_unit_count) break;
             float d = distance(fragCoord, u_centers[i]);
@@ -129,7 +126,6 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
             }
           }
 
-          // Pass 2: Smoothly evaluate clear visibility from all halos outside the bright cores
           float maxVis = 0.0;
           for (int i = 0; i < 4; i++) {
             if (i >= u_unit_count) break;
@@ -138,8 +134,6 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
             float rOuter = u_radii[i];
 
             if (d < rOuter) {
-              // Smooth Hermite interpolation from inner (1.0 visibility) to outer (0.0 visibility)
-              // Guarantees zero derivative at boundary lines
               float vis = 1.0 - smoothstep(rInner, rOuter, d);
               maxVis = smax(maxVis, vis, 0.08);
             }
@@ -247,7 +241,10 @@ export default function App() {
   const isMapReadyRef = useRef(false);
   const unitsPlacedRef = useRef(false);
   const markersRef = useRef(new Map());
+  const destMarkersRef = useRef(new Map());
   const opponentFeaturesRef = useRef([]);
+
+  const selectionOrderRef = useRef(DOT_CONFIGS.map((c) => c.id));
 
   const [ourTeamColor] = useState(() => TEAM_COLORS[Math.floor(Math.random() * TEAM_COLORS.length)]);
   const ourTeamColorRef = useRef(ourTeamColor);
@@ -297,19 +294,63 @@ export default function App() {
     }))
   );
 
+  // Re-stack markers: least-recently selected to most-recently selected
+  const updateStackingOrder = () => {
+    const order = selectionOrderRef.current;
+    order.forEach((id, rank) => {
+      const destMarker = destMarkersRef.current.get(id);
+      const unitMarker = markersRef.current.get(id);
+
+      const destZ = 10 + rank * 2;
+      const unitZ = 10 + rank * 2 + 1;
+
+      if (destMarker) {
+        const destEl = destMarker.getElement();
+        destEl.style.zIndex = `${destZ}`;
+        if (destEl.parentNode) {
+          destEl.parentNode.appendChild(destEl);
+        }
+      }
+
+      if (unitMarker) {
+        const unitEl = unitMarker.getElement();
+        unitEl.style.zIndex = `${unitZ}`;
+        if (unitEl.parentNode) {
+          unitEl.parentNode.appendChild(unitEl);
+        }
+      }
+    });
+  };
+
   const syncMapGraphics = () => {
     const map = mapRef.current;
     if (!map || !isMapReadyRef.current) return;
 
-    // 1. Update HTML Unit Markers
     dotsRef.current.forEach((dot) => {
       const marker = markersRef.current.get(dot.id);
       if (marker) {
         marker.setLngLat([dot.pos[1], dot.pos[0]]);
       }
+
+      const destMarker = destMarkersRef.current.get(dot.id);
+      if (destMarker) {
+        const hasDest =
+          dot.state !== "Stop" &&
+          dot.waypoints &&
+          dot.waypoints.length > 1 &&
+          dot.segIdx < dot.waypoints.length - 1;
+
+        const destEl = destMarker.getElement();
+        if (hasDest) {
+          const destCoord = dot.waypoints[dot.waypoints.length - 1];
+          destMarker.setLngLat([destCoord[1], destCoord[0]]);
+          destEl.style.display = "flex";
+        } else {
+          destEl.style.display = "none";
+        }
+      }
     });
 
-    // 2. Build continuous multi-point paths
     const lineFeatures = [];
     const ringFeatures = [];
     const visionFeatures = [];
@@ -414,7 +455,7 @@ export default function App() {
         id: "satellite-layer",
         type: "raster",
         source: "satellite-tiles",
-        minzoom: 0,
+        minzoom: 10,
         maxzoom: 22,
         layout: {
           visibility: isSatelliteRef.current ? "visible" : "none",
@@ -463,7 +504,7 @@ export default function App() {
         id: "unit-paths-layer",
         type: "line",
         source: "unit-paths",
-        minzoom: 0,
+        minzoom: 10,
         maxzoom: 24,
         layout: {
           "line-join": "round",
@@ -500,7 +541,7 @@ export default function App() {
         id: "dest-rings-layer",
         type: "line",
         source: "dest-rings",
-        minzoom: 0,
+        minzoom: 10,
         maxzoom: 24,
         paint: {
           "line-color": teamColor,
@@ -521,7 +562,7 @@ export default function App() {
         id: "vision-circles-fill",
         type: "fill",
         source: "vision-circles",
-        minzoom: 0,
+        minzoom: 10,
         maxzoom: 24,
         paint: {
           "fill-color": teamColor,
@@ -533,7 +574,7 @@ export default function App() {
         id: "vision-circles-stroke",
         type: "line",
         source: "vision-circles",
-        minzoom: 0,
+        minzoom: 10,
         maxzoom: 24,
         paint: {
           "line-color": teamColor,
@@ -559,7 +600,7 @@ export default function App() {
       style: MAP_STYLE,
       center: [114.1694, 22.3193],
       zoom: 12,
-      minZoom: 1,
+      minZoom: 10,
       maxZoom: 19,
       attributionControl: false,
     });
@@ -577,6 +618,43 @@ export default function App() {
       setupLayers(map);
 
       dotsRef.current.forEach((dot) => {
+        const MarkerClass = maplibregl.Marker || maplibregl.default?.Marker;
+
+        // 1. Destination Marker (Click-through enabled via pointer-events: none)
+        const destEl = document.createElement("div");
+        destEl.id = `marker-dest-${dot.id}`;
+        destEl.style.fontSize = "24px";
+        destEl.style.width = "40px";
+        destEl.style.height = "40px";
+        destEl.style.display = "none";
+        destEl.style.alignItems = "center";
+        destEl.style.justifyContent = "center";
+        destEl.style.userSelect = "none";
+        destEl.style.pointerEvents = "none"; // Clicks pass through to map
+        destEl.style.setProperty("opacity", "0.3", "important");
+        destEl.style.filter = "none";
+
+        const destInner = document.createElement("span");
+        destInner.className = "dest-emoji-content";
+        destInner.innerText = dot.symbol;
+        destInner.style.display = "flex";
+        destInner.style.alignItems = "center";
+        destInner.style.justifyContent = "center";
+        destInner.style.setProperty("opacity", "0.3", "important");
+        destInner.style.pointerEvents = "none"; // Clicks pass through
+        destEl.appendChild(destInner);
+
+        const destMarker = new MarkerClass({ element: destEl, opacity: "0.3" })
+          .setLngLat([dot.pos[1], dot.pos[0]])
+          .addTo(map);
+
+        if (destMarker.setOpacity) {
+          destMarker.setOpacity("0.3");
+        }
+
+        destMarkersRef.current.set(dot.id, destMarker);
+
+        // 2. Current Unit Marker (Click-through enabled via pointer-events: none)
         const el = document.createElement("div");
         el.id = `marker-unit-${dot.id}`;
         el.innerText = dot.symbol;
@@ -587,16 +665,17 @@ export default function App() {
         el.style.alignItems = "center";
         el.style.justifyContent = "center";
         el.style.userSelect = "none";
+        el.style.pointerEvents = "none"; // Clicks pass through to map
         el.style.filter = `drop-shadow(0 0 6px ${ourTeamColorRef.current})`;
-        el.style.cursor = "pointer";
 
-        const MarkerClass = maplibregl.Marker || maplibregl.default?.Marker;
         const marker = new MarkerClass({ element: el })
           .setLngLat([dot.pos[1], dot.pos[0]])
           .addTo(map);
 
         markersRef.current.set(dot.id, marker);
       });
+
+      updateStackingOrder();
 
       initGraph()
         .then(async ({ bbox }) => {
@@ -662,6 +741,8 @@ export default function App() {
     return () => {
       markersRef.current.forEach((m) => m.remove());
       markersRef.current.clear();
+      destMarkersRef.current.forEach((m) => m.remove());
+      destMarkersRef.current.clear();
       map.remove();
       mapRef.current = null;
       isMapReadyRef.current = false;
@@ -775,8 +856,10 @@ export default function App() {
     return () => cancelAnimationFrame(animId);
   }, []);
 
+  // Update selection styling and maintain 30% opacity guarantee
   useEffect(() => {
     const color = ourTeamColorRef.current;
+
     markersRef.current.forEach((marker, id) => {
       const el = marker.getElement();
       if (id === selectedId) {
@@ -791,6 +874,32 @@ export default function App() {
         el.style.height = "40px";
       }
     });
+
+    destMarkersRef.current.forEach((destMarker, id) => {
+      const el = destMarker.getElement();
+      el.style.setProperty("opacity", "0.4", "important");
+      if (destMarker.setOpacity) {
+        destMarker.setOpacity("0.4");
+      }
+      const inner = el.querySelector(".dest-emoji-content");
+      if (inner) {
+        inner.style.setProperty("opacity", "0.4", "important");
+      }
+
+      if (id === selectedId) {
+        el.style.filter = `drop-shadow(0 0 6px ${color})`;
+        el.style.fontSize = "32px";
+        el.style.width = "50px";
+        el.style.height = "50px";
+      } else {
+        el.style.filter = "none";
+        el.style.fontSize = "24px";
+        el.style.width = "40px";
+        el.style.height = "40px";
+      }
+    });
+
+    updateStackingOrder();
   }, [selectedId]);
 
   const handleToggleSelect = (id) => {
@@ -803,6 +912,12 @@ export default function App() {
     } else {
       selectedIdRef.current = id;
       setSelectedId(id);
+
+      selectionOrderRef.current = [
+        ...selectionOrderRef.current.filter((x) => x !== id),
+        id,
+      ];
+
       const dot = dotsRef.current[id];
       if (dot) {
         map.panTo([dot.pos[1], dot.pos[0]], { duration: 400 });
@@ -824,6 +939,7 @@ export default function App() {
     }
   };
 
+  // Map Click Rerouting (now works anywhere on map, including clicks over emojis)
   useEffect(() => {
     if (!mapRef.current) return;
 
