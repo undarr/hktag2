@@ -3,6 +3,42 @@ import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { initGraph, snap, pathfind } from "./fetch";
 
+// --- GLOWING CIRCLE & DYNAMIC BOUNDARY CONFIG ---
+const CIRCLE_CENTER_LAT = 22.3749714;
+const CIRCLE_CENTER_LON = 114.1391081;
+const CIRCLE_RADIUS_METERS = 36711.51;
+const BOUNDARY_MARGIN_METERS = 2500.0;
+const BASE_SPAN_METERS = CIRCLE_RADIUS_METERS + BOUNDARY_MARGIN_METERS; // 39,211.51m
+
+function calculateDynamicBounds(width, height) {
+  const w = width || window.innerWidth || 1;
+  const h = height || window.innerHeight || 1;
+
+  let spanNorthSouthMeters;
+  let spanEastWestMeters;
+
+  if (w > h) {
+    // Landscape: 2500m away from top and bottom; scale east-west by aspect ratio
+    spanNorthSouthMeters = BASE_SPAN_METERS;
+    spanEastWestMeters = BASE_SPAN_METERS * (w / h);
+  } else {
+    // Portrait: 2500m away from left and right; scale north-south by inverse aspect ratio
+    spanEastWestMeters = BASE_SPAN_METERS;
+    spanNorthSouthMeters = BASE_SPAN_METERS * (h / w);
+  }
+
+  const dLat = (spanNorthSouthMeters / 6371000.0) * (180 / Math.PI);
+  const dLon =
+    (spanEastWestMeters /
+      (6371000.0 * Math.cos((CIRCLE_CENTER_LAT * Math.PI) / 180))) *
+    (180 / Math.PI);
+
+  return [
+    [CIRCLE_CENTER_LON - dLon, CIRCLE_CENTER_LAT - dLat], // Southwest [lng, lat]
+    [CIRCLE_CENTER_LON + dLon, CIRCLE_CENTER_LAT + dLat], // Northeast [lng, lat]
+  ];
+}
+
 const SATELLITE_STYLE = {
   version: 8,
   sources: {
@@ -20,7 +56,7 @@ const SATELLITE_STYLE = {
       id: "satellite-layer",
       type: "raster",
       source: "satellite-tiles",
-      minzoom: 10,
+      minzoom: 9,
       maxzoom: 22,
     },
   ],
@@ -59,7 +95,7 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 32) {
+function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 128) {
   const coords = [];
   const km = radiusMeters / 1000.0;
   const dRad = km / 6371.0;
@@ -83,7 +119,7 @@ function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 32) {
   return coords;
 }
 
-// Custom WebGL Fog-of-War Layer with Seamless Halo Blending
+// Custom WebGL Fog-of-War Layer
 function createFogLayer(dotsRef, unitsPlacedRef) {
   return {
     id: "fog-of-war-layer",
@@ -294,7 +330,6 @@ export default function App() {
     }))
   );
 
-  // Re-stack markers: least-recently selected to most-recently selected
   const updateStackingOrder = () => {
     const order = selectionOrderRef.current;
     order.forEach((id, rank) => {
@@ -307,17 +342,13 @@ export default function App() {
       if (destMarker) {
         const destEl = destMarker.getElement();
         destEl.style.zIndex = `${destZ}`;
-        if (destEl.parentNode) {
-          destEl.parentNode.appendChild(destEl);
-        }
+        if (destEl.parentNode) destEl.parentNode.appendChild(destEl);
       }
 
       if (unitMarker) {
         const unitEl = unitMarker.getElement();
         unitEl.style.zIndex = `${unitZ}`;
-        if (unitEl.parentNode) {
-          unitEl.parentNode.appendChild(unitEl);
-        }
+        if (unitEl.parentNode) unitEl.parentNode.appendChild(unitEl);
       }
     });
   };
@@ -378,9 +409,7 @@ export default function App() {
                 type: "LineString",
                 coordinates: currentCoords,
               },
-              properties: {
-                isWater: currentWater,
-              },
+              properties: { isWater: currentWater },
             });
             currentWater = isWater;
             currentCoords = [[waypoints[i][1], waypoints[i][0]], nextPt];
@@ -394,9 +423,7 @@ export default function App() {
               type: "LineString",
               coordinates: currentCoords,
             },
-            properties: {
-              isWater: currentWater,
-            },
+            properties: { isWater: currentWater },
           });
         }
 
@@ -440,7 +467,9 @@ export default function App() {
   const setupLayers = (map) => {
     if (!map) return;
     const teamColor = ourTeamColorRef.current;
+    const ringColor = isSatelliteRef.current ? "#FFE500" : "#000000";
 
+    // 1. Satellite Base Layer
     if (!map.getSource("satellite-tiles")) {
       map.addSource("satellite-tiles", {
         type: "raster",
@@ -455,7 +484,7 @@ export default function App() {
         id: "satellite-layer",
         type: "raster",
         source: "satellite-tiles",
-        minzoom: 10,
+        minzoom: 9,
         maxzoom: 22,
         layout: {
           visibility: isSatelliteRef.current ? "visible" : "none",
@@ -463,6 +492,71 @@ export default function App() {
       });
     }
 
+    // 2. Glowing Boundary Circle Layers
+    if (!map.getSource("glowing-circle-source")) {
+      const circlePolyCoords = createCircleGeoJSON(
+        CIRCLE_CENTER_LAT,
+        CIRCLE_CENTER_LON,
+        CIRCLE_RADIUS_METERS,
+        128
+      );
+
+      map.addSource("glowing-circle-source", {
+        type: "geojson",
+        data: {
+          type: "FeatureCollection",
+          features: [
+            {
+              type: "Feature",
+              geometry: {
+                type: "Polygon",
+                coordinates: [circlePolyCoords],
+              },
+            },
+          ],
+        },
+      });
+
+      // Layer A: Outer Soft Aura
+      map.addLayer({
+        id: "glowing-circle-outer",
+        type: "line",
+        source: "glowing-circle-source",
+        paint: {
+          "line-color": ringColor,
+          "line-width": 18,
+          "line-blur": 10,
+          "line-opacity": 0.45,
+        },
+      });
+
+      // Layer B: Mid Glow Aura
+      map.addLayer({
+        id: "glowing-circle-mid",
+        type: "line",
+        source: "glowing-circle-source",
+        paint: {
+          "line-color": ringColor,
+          "line-width": 7,
+          "line-blur": 3,
+          "line-opacity": 0.75,
+        },
+      });
+
+      // Layer C: Core Crisp Ring
+      map.addLayer({
+        id: "glowing-circle-core",
+        type: "line",
+        source: "glowing-circle-source",
+        paint: {
+          "line-color": ringColor,
+          "line-width": 2.5,
+          "line-opacity": 1.0,
+        },
+      });
+    }
+
+    // 3. Opponent Units
     if (!map.getSource("opponent-units")) {
       map.addSource("opponent-units", {
         type: "geojson",
@@ -492,6 +586,7 @@ export default function App() {
       });
     }
 
+    // 4. Paths & Vision Rings
     if (!map.getSource("unit-paths")) {
       map.addSource("unit-paths", {
         type: "geojson",
@@ -504,12 +599,9 @@ export default function App() {
         id: "unit-paths-layer",
         type: "line",
         source: "unit-paths",
-        minzoom: 10,
+        minzoom: 9,
         maxzoom: 24,
-        layout: {
-          "line-join": "round",
-          "line-cap": "round",
-        },
+        layout: { "line-join": "round", "line-cap": "round" },
         paint: {
           "line-width": [
             "interpolate",
@@ -541,7 +633,7 @@ export default function App() {
         id: "dest-rings-layer",
         type: "line",
         source: "dest-rings",
-        minzoom: 10,
+        minzoom: 9,
         maxzoom: 24,
         paint: {
           "line-color": teamColor,
@@ -562,7 +654,7 @@ export default function App() {
         id: "vision-circles-fill",
         type: "fill",
         source: "vision-circles",
-        minzoom: 10,
+        minzoom: 9,
         maxzoom: 24,
         paint: {
           "fill-color": teamColor,
@@ -574,7 +666,7 @@ export default function App() {
         id: "vision-circles-stroke",
         type: "line",
         source: "vision-circles",
-        minzoom: 10,
+        minzoom: 9,
         maxzoom: 24,
         paint: {
           "line-color": teamColor,
@@ -583,6 +675,7 @@ export default function App() {
       });
     }
 
+    // 5. Fog-of-War Shader Layer
     if (!map.getLayer("fog-of-war-layer")) {
       map.addLayer(createFogLayer(dotsRef, unitsPlacedRef));
     }
@@ -593,19 +686,38 @@ export default function App() {
   useEffect(() => {
     if (!mapContainerRef.current) return;
 
+    const initialBounds = calculateDynamicBounds(
+      window.innerWidth,
+      window.innerHeight
+    );
+
     const MapConstructor = maplibregl.Map || maplibregl.default?.Map;
 
     const map = new MapConstructor({
       container: mapContainerRef.current,
       style: MAP_STYLE,
-      center: [114.1694, 22.3193],
-      zoom: 12,
-      minZoom: 10,
+      center: [CIRCLE_CENTER_LON, CIRCLE_CENTER_LAT],
+      zoom: 10.5,
+      minZoom: 9,
       maxZoom: 19,
+      maxBounds: initialBounds,
+      maxBoundsViscosity: 0.0, // Strict bounce back
       attributionControl: false,
     });
 
     mapRef.current = map;
+
+    // Window Resize Handler to dynamically update strict aspect-ratio bounds
+    const handleResize = () => {
+      if (!mapRef.current) return;
+      const container = mapContainerRef.current;
+      const w = container ? container.clientWidth : window.innerWidth;
+      const h = container ? container.clientHeight : window.innerHeight;
+      const dynamicBounds = calculateDynamicBounds(w, h);
+      mapRef.current.setMaxBounds(dynamicBounds);
+    };
+
+    window.addEventListener("resize", handleResize);
 
     map.on("styledata", () => {
       if (map.isStyleLoaded()) {
@@ -617,10 +729,13 @@ export default function App() {
       isMapReadyRef.current = true;
       setupLayers(map);
 
+      // Fit map so circle and 2500m margin fill the viewport precisely
+      map.fitBounds(initialBounds, { padding: 0, duration: 0 });
+
       dotsRef.current.forEach((dot) => {
         const MarkerClass = maplibregl.Marker || maplibregl.default?.Marker;
 
-        // 1. Destination Marker (Click-through enabled via pointer-events: none)
+        // Destination Marker
         const destEl = document.createElement("div");
         destEl.id = `marker-dest-${dot.id}`;
         destEl.style.fontSize = "24px";
@@ -630,8 +745,8 @@ export default function App() {
         destEl.style.alignItems = "center";
         destEl.style.justifyContent = "center";
         destEl.style.userSelect = "none";
-        destEl.style.pointerEvents = "none"; // Clicks pass through to map
-        destEl.style.setProperty("opacity", "0.3", "important");
+        destEl.style.pointerEvents = "none";
+        destEl.style.setProperty("opacity", "0.6", "important");
         destEl.style.filter = "none";
 
         const destInner = document.createElement("span");
@@ -640,21 +755,21 @@ export default function App() {
         destInner.style.display = "flex";
         destInner.style.alignItems = "center";
         destInner.style.justifyContent = "center";
-        destInner.style.setProperty("opacity", "0.3", "important");
-        destInner.style.pointerEvents = "none"; // Clicks pass through
+        destInner.style.setProperty("opacity", "0.6", "important");
+        destInner.style.pointerEvents = "none";
         destEl.appendChild(destInner);
 
-        const destMarker = new MarkerClass({ element: destEl, opacity: "0.3" })
+        const destMarker = new MarkerClass({ element: destEl, opacity: "0.6" })
           .setLngLat([dot.pos[1], dot.pos[0]])
           .addTo(map);
 
         if (destMarker.setOpacity) {
-          destMarker.setOpacity("0.3");
+          destMarker.setOpacity("0.6");
         }
 
         destMarkersRef.current.set(dot.id, destMarker);
 
-        // 2. Current Unit Marker (Click-through enabled via pointer-events: none)
+        // Unit Marker
         const el = document.createElement("div");
         el.id = `marker-unit-${dot.id}`;
         el.innerText = dot.symbol;
@@ -665,7 +780,7 @@ export default function App() {
         el.style.alignItems = "center";
         el.style.justifyContent = "center";
         el.style.userSelect = "none";
-        el.style.pointerEvents = "none"; // Clicks pass through to map
+        el.style.pointerEvents = "none";
         el.style.filter = `drop-shadow(0 0 6px ${ourTeamColorRef.current})`;
 
         const marker = new MarkerClass({ element: el })
@@ -679,14 +794,6 @@ export default function App() {
 
       initGraph()
         .then(async ({ bbox }) => {
-          map.fitBounds(
-            [
-              [bbox[0][1], bbox[0][0]],
-              [bbox[1][1], bbox[1][0]],
-            ],
-            { padding: 20, duration: 0 }
-          );
-
           const playerSnapPromises = dotsRef.current.map(() => {
             const randLat = bbox[0][0] + Math.random() * (bbox[1][0] - bbox[0][0]);
             const randLon = bbox[0][1] + Math.random() * (bbox[1][0] - bbox[0][1]);
@@ -739,6 +846,7 @@ export default function App() {
     });
 
     return () => {
+      window.removeEventListener("resize", handleResize);
       markersRef.current.forEach((m) => m.remove());
       markersRef.current.clear();
       destMarkersRef.current.forEach((m) => m.remove());
@@ -856,7 +964,7 @@ export default function App() {
     return () => cancelAnimationFrame(animId);
   }, []);
 
-  // Update selection styling and maintain 30% opacity guarantee
+  // Selection styling
   useEffect(() => {
     const color = ourTeamColorRef.current;
 
@@ -877,13 +985,13 @@ export default function App() {
 
     destMarkersRef.current.forEach((destMarker, id) => {
       const el = destMarker.getElement();
-      el.style.setProperty("opacity", "0.4", "important");
+      el.style.setProperty("opacity", "0.6", "important");
       if (destMarker.setOpacity) {
-        destMarker.setOpacity("0.4");
+        destMarker.setOpacity("0.6");
       }
       const inner = el.querySelector(".dest-emoji-content");
       if (inner) {
-        inner.style.setProperty("opacity", "0.4", "important");
+        inner.style.setProperty("opacity", "0.6", "important");
       }
 
       if (id === selectedId) {
@@ -937,9 +1045,16 @@ export default function App() {
     } else {
       map.setStyle(nextSatellite ? SATELLITE_STYLE : MAP_STYLE);
     }
+
+    const newGlowColor = nextSatellite ? "#FFE500" : "#000000";
+    ["glowing-circle-outer", "glowing-circle-mid", "glowing-circle-core"].forEach((layerId) => {
+      if (map.getLayer(layerId)) {
+        map.setPaintProperty(layerId, "line-color", newGlowColor);
+      }
+    });
   };
 
-  // Map Click Rerouting (now works anywhere on map, including clicks over emojis)
+  // Map Click Rerouting
   useEffect(() => {
     if (!mapRef.current) return;
 
@@ -1197,7 +1312,7 @@ export default function App() {
         {isSatellite ? "🗺️" : "🌍"}
       </button>
 
-      {/* Left-Hand Unit Selection Toolbar */}
+      {/* Unit Selection Toolbar */}
       <div
         style={{
           position: "absolute",
@@ -1242,7 +1357,7 @@ export default function App() {
         })}
       </div>
 
-      {/* Bottom Tactical Card */}
+      {/* Bottom Tactical Drawer */}
       <div
         style={{
           position: "absolute",
