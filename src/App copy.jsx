@@ -1,50 +1,28 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { initGraph, snap, pathfind } from "./fetch";
 
-const SATELLITE_TILES_URL =
-  "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
-const STREET_TILES_URL =
-  "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
-
-// Base style hosting both satellite and standard street raster sources
-const BASE_STYLE = {
+const OPENFREEMAP_STYLE = "https://tiles.openfreemap.org/styles/liberty";
+const SATELLITE_STYLE = {
   version: 8,
   sources: {
     "satellite-tiles": {
       type: "raster",
-      tiles: [SATELLITE_TILES_URL],
-      tileSize: 256,
-      maxzoom: 19,
-    },
-    "street-tiles": {
-      type: "raster",
-      tiles: [STREET_TILES_URL],
+      tiles: [
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      ],
       tileSize: 256,
       maxzoom: 19,
     },
   },
   layers: [
     {
-      id: "street-layer",
-      type: "raster",
-      source: "street-tiles",
-      minzoom: 0,
-      maxzoom: 22,
-      layout: {
-        visibility: "none",
-      },
-    },
-    {
       id: "satellite-layer",
       type: "raster",
       source: "satellite-tiles",
       minzoom: 0,
       maxzoom: 22,
-      layout: {
-        visibility: "visible",
-      },
     },
   ],
 };
@@ -56,15 +34,6 @@ const TEAM_COLORS = [
 ];
 
 const OUR_TEAM_COLOR = TEAM_COLORS[0];
-
-// Initial order when never selected:
-// Chopper (0, bottom) -> Cruiser (1) -> Officer (2) -> Runner (3, top)
-const INITIAL_PRIORITY = {
-  2: 0, // Chopper
-  1: 1, // Cruiser
-  0: 2, // Officer
-  3: 3, // Runner
-};
 
 const DOT_CONFIGS = [
   { id: 0, symbol: "👮", name: "Officer" },
@@ -91,173 +60,61 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Generate circular polygon GeoJSON for unit vision bounds & destinations
-function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 32) {
-  const coords = [];
-  const km = radiusMeters / 1000.0;
-  const dRad = km / 6371.0;
-  const cLat = (centerLat * Math.PI) / 180.0;
-  const cLon = (centerLon * Math.PI) / 180.0;
-
-  for (let i = 0; i <= points; i++) {
-    const bearing = (i * 2 * Math.PI) / points;
-    const lat = Math.asin(
-      Math.sin(cLat) * Math.cos(dRad) +
-        Math.cos(cLat) * Math.sin(dRad) * Math.cos(bearing)
-    );
-    const lon =
-      cLon +
-      Math.atan2(
-        Math.sin(bearing) * Math.sin(dRad) * Math.cos(cLat),
-        Math.cos(dRad) - Math.sin(cLat) * Math.sin(lat)
-      );
-    coords.push([(lon * 180.0) / Math.PI, (lat * 180.0) / Math.PI]);
+function getMetersToPixels(map, lat, meters) {
+  if (!map || isNaN(lat)) return 0;
+  try {
+    const latRad = lat * (Math.PI / 180);
+    const zoom = map.getZoom();
+    const metersPerPx = (40075016.686 * Math.cos(latRad)) / (512 * Math.pow(2, zoom));
+    return meters / metersPerPx;
+  } catch {
+    return 0;
   }
-  return coords;
 }
 
-// Pre-render unit emoji icons as canvas image textures with drop-shadows
-function createEmojiImage(symbol, isSelected) {
-  const canvas = document.createElement("canvas");
-  const size = 128;
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext("2d");
+const emojiCanvasCache = new Map();
 
-  if (isSelected) {
-    ctx.filter = `drop-shadow(0 0 15px ${OUR_TEAM_COLOR}) drop-shadow(0 0 10px ${OUR_TEAM_COLOR}) drop-shadow(0 0 5px ${OUR_TEAM_COLOR})`;
-  } else {
-    ctx.filter = `drop-shadow(0 0 6px ${OUR_TEAM_COLOR})`;
+function getPrebakedCanvasTexture(symbol, color = OUR_TEAM_COLOR, isStrongGlow = false) {
+  const cacheKey = `${symbol}_${color}_${isStrongGlow}`;
+  if (emojiCanvasCache.has(cacheKey)) {
+    return emojiCanvasCache.get(cacheKey);
   }
 
-  ctx.font = "60px 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif";
+  const displaySize = isStrongGlow ? 48 : 40;
+  const scale = 2;
+  const canvasSize = displaySize * scale;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = canvasSize;
+  canvas.height = canvasSize;
+  const ctx = canvas.getContext("2d");
+  const center = canvasSize / 2;
+
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(symbol, size / 2, size / 2);
+  const fontSize = isStrongGlow ? 22 * scale : 19 * scale;
+  ctx.font = `${fontSize}px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif`;
 
-  return ctx.getImageData(0, 0, size, size);
-}
+  if (isStrongGlow) {
+    ctx.shadowColor = "#ffffff";
+    ctx.shadowBlur = 18 * scale;
+    ctx.fillText(symbol, center, center);
 
-// Custom WebGL Fog-of-War Layer
-function createFogLayer(dotsRef, unitsPlacedRef) {
-  return {
-    id: "fog-of-war-layer",
-    type: "custom",
-    renderingMode: "2d",
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 8 * scale;
+    ctx.fillText(symbol, center, center);
+  } else {
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 8 * scale;
+    ctx.fillText(symbol, center, center);
+  }
 
-    onAdd(map, gl) {
-      this.map = map;
-      this.gl = gl;
+  ctx.shadowBlur = 0;
+  ctx.fillText(symbol, center, center);
 
-      const vertexSource = `
-        attribute vec2 a_pos;
-        void main() {
-          gl_Position = vec4(a_pos, 0.0, 1.0);
-        }
-      `;
-
-      const fragmentSource = `
-        precision highp float;
-        uniform vec2 u_resolution;
-        uniform vec2 u_centers[4];
-        uniform float u_radii[4];
-        uniform int u_unit_count;
-
-        void main() {
-          vec2 fragCoord = gl_FragCoord.xy;
-          fragCoord.y = u_resolution.y - fragCoord.y;
-
-          float minFog = 0.72;
-
-          for (int i = 0; i < 4; i++) {
-            if (i >= u_unit_count) break;
-            float d = distance(fragCoord, u_centers[i]);
-            float rInner = u_radii[i] * (400.0 / 600.0);
-            float rOuter = u_radii[i];
-
-            if (d < rInner) {
-              minFog = 0.0;
-            } else if (d < rOuter) {
-              float factor = (d - rInner) / (rOuter - rInner);
-              minFog = min(minFog, factor * 0.72);
-            }
-          }
-
-          if (minFog <= 0.0) {
-            discard;
-          }
-          gl_FragColor = vec4(0.027, 0.054, 0.090, minFog);
-        }
-      `;
-
-      const createShader = (type, src) => {
-        const shader = gl.createShader(type);
-        gl.shaderSource(shader, src);
-        gl.compileShader(shader);
-        return shader;
-      };
-
-      const prog = gl.createProgram();
-      gl.attachShader(prog, createShader(gl.VERTEX_SHADER, vertexSource));
-      gl.attachShader(prog, createShader(gl.FRAGMENT_SHADER, fragmentSource));
-      gl.linkProgram(prog);
-      this.program = prog;
-
-      this.aPos = gl.getAttribLocation(prog, "a_pos");
-      this.uRes = gl.getUniformLocation(prog, "u_resolution");
-      this.uCenters = gl.getUniformLocation(prog, "u_centers[0]");
-      this.uRadii = gl.getUniformLocation(prog, "u_radii[0]");
-      this.uCount = gl.getUniformLocation(prog, "u_unit_count");
-
-      this.vertexBuffer = gl.createBuffer();
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
-      gl.bufferData(
-        gl.ARRAY_BUFFER,
-        new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
-        gl.STATIC_DRAW
-      );
-    },
-
-    render(gl) {
-      if (!unitsPlacedRef.current) return;
-
-      gl.useProgram(this.program);
-      gl.enable(gl.BLEND);
-      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-      const map = this.map;
-      const canvas = map.getCanvas();
-      const width = canvas.width;
-      const height = canvas.height;
-
-      gl.uniform2f(this.uRes, width, height);
-      gl.uniform1i(this.uCount, dotsRef.current.length);
-
-      const centers = [];
-      const radii = [];
-
-      dotsRef.current.forEach((dot) => {
-        const pt = map.project([dot.pos[1], dot.pos[0]]);
-        const dpr = window.devicePixelRatio || 1;
-        centers.push(pt.x * dpr, pt.y * dpr);
-
-        const latRad = dot.pos[0] * (Math.PI / 180);
-        const zoom = map.getZoom();
-        const metersPerPx = (40075016.686 * Math.cos(latRad)) / (512 * Math.pow(2, zoom));
-        const sightRadius = dot.sightRadius || 600;
-        radii.push((sightRadius / metersPerPx) * dpr);
-      });
-
-      gl.uniform2fv(this.uCenters, new Float32Array(centers));
-      gl.uniform1fv(this.uRadii, new Float32Array(radii));
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
-      gl.enableVertexAttribArray(this.aPos);
-      gl.vertexAttribPointer(this.aPos, 2, gl.FLOAT, false, 0, 0);
-
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
-    },
-  };
+  const textureRecord = { canvas, displaySize };
+  emojiCanvasCache.set(cacheKey, textureRecord);
+  return textureRecord;
 }
 
 export default function App() {
@@ -266,14 +123,11 @@ export default function App() {
   const isMapReadyRef = useRef(false);
   const unitsPlacedRef = useRef(false);
 
+  const pathsCanvasRef = useRef(null);
+  const fogCanvasRef = useRef(null);
+
   const [selectedId, setSelectedId] = useState(null);
   const selectedIdRef = useRef(null);
-
-  // Basemap style toggle state: 'satellite' | 'street'
-  const [mapMode, setMapMode] = useState("satellite");
-
-  // Recency stack of selected unit IDs (MRU at index 0)
-  const selectionHistoryRef = useRef([]);
 
   const [dotsUI, setDotsUI] = useState(
     DOT_CONFIGS.map((cfg) => ({
@@ -286,7 +140,6 @@ export default function App() {
       distLeft: "--",
       speed: 20.0,
       radius: 25,
-      sightRadius: 600,
     }))
   );
 
@@ -299,9 +152,6 @@ export default function App() {
       state: "Stop",
       speed: 20.0,
       radius: 25,
-      targetRadius: 25,
-      sightRadius: 600,
-      targetSightRadius: 600,
       waypoints: [],
       waterFlags: [],
       segIdx: 0,
@@ -312,125 +162,166 @@ export default function App() {
     }))
   );
 
-  const toggleMapMode = () => {
+  const syncCanvasSize = useCallback(() => {
+    const container = mapContainerRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    const w = Math.floor(rect.width);
+    const h = Math.floor(rect.height);
+
+    if (w <= 0 || h <= 0) return;
+
+    [pathsCanvasRef.current, fogCanvasRef.current].forEach((cv) => {
+      if (cv && (cv.width !== w || cv.height !== h)) {
+        cv.width = w;
+        cv.height = h;
+      }
+    });
+  }, []);
+
+  const safeProject = (lat, lon) => {
     const map = mapRef.current;
-    if (!map || !isMapReadyRef.current) return;
-
-    const nextMode = mapMode === "satellite" ? "street" : "satellite";
-    setMapMode(nextMode);
-
-    if (nextMode === "street") {
-      map.setLayoutProperty("satellite-layer", "visibility", "none");
-      map.setLayoutProperty("street-layer", "visibility", "visible");
-    } else {
-      map.setLayoutProperty("street-layer", "visibility", "none");
-      map.setLayoutProperty("satellite-layer", "visibility", "visible");
+    if (!map || !isMapReadyRef.current) return null;
+    try {
+      return map.project([lon, lat]);
+    } catch {
+      return null;
     }
   };
 
-  // Synchronize dynamic GPU layers with game state in the same WebGL loop
-  const syncMapGraphics = () => {
+  const drawDynamicElements = () => {
+    const canvas = pathsCanvasRef.current;
     const map = mapRef.current;
-    if (!map || !isMapReadyRef.current) return;
+    if (!map || !canvas || canvas.width === 0 || !isMapReadyRef.current) return;
 
-    const lineFeatures = [];
-    const ringFeatures = [];
-    const visionFeatures = [];
-    const unitFeatures = [];
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    const activeSelectedId = selectedIdRef.current;
-    const history = selectionHistoryRef.current;
+    // Pass A: Paths
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
 
-    const getUnitPriority = (id) => {
-      if (id === activeSelectedId) return 100000;
-      const historyIndex = history.indexOf(id);
-      if (historyIndex !== -1) {
-        return 5000 - historyIndex;
-      }
-      return INITIAL_PRIORITY[id];
-    };
+    dotsRef.current.forEach((dot) => {
+      const { waypoints, waterFlags, segIdx, pos, radius } = dot;
+      if (!waypoints || waypoints.length <= 1 || segIdx >= waypoints.length - 1) return;
 
-    const sortedDots = [...dotsRef.current].sort(
-      (a, b) => getUnitPriority(a.id) - getUnitPriority(b.id)
-    );
+      for (let i = segIdx; i < waypoints.length - 1; i++) {
+        const isWater = waterFlags[i] === 1;
+        const startPt = i === segIdx ? safeProject(pos[0], pos[1]) : safeProject(waypoints[i][0], waypoints[i][1]);
+        const endPt = safeProject(waypoints[i + 1][0], waypoints[i + 1][1]);
 
-    sortedDots.forEach((dot) => {
-      const { waypoints, waterFlags, segIdx, pos, radius, id } = dot;
-      const isSelected = id === activeSelectedId;
-      const priority = getUnitPriority(id);
+        if (!startPt || !endPt) continue;
 
-      // Active path lines
-      if (waypoints && waypoints.length > 1 && segIdx < waypoints.length - 1) {
-        for (let i = segIdx; i < waypoints.length - 1; i++) {
-          const start = i === segIdx ? [pos[1], pos[0]] : [waypoints[i][1], waypoints[i][0]];
-          const end = [waypoints[i + 1][1], waypoints[i + 1][0]];
-
-          lineFeatures.push({
-            type: "Feature",
-            geometry: {
-              type: "LineString",
-              coordinates: [start, end],
-            },
-            properties: {
-              isWater: waterFlags[i] === 1,
-            },
-          });
-        }
-
-        const dest = waypoints[waypoints.length - 1];
-        ringFeatures.push({
-          type: "Feature",
-          geometry: {
-            type: "Polygon",
-            coordinates: [createCircleGeoJSON(dest[0], dest[1], radius)],
-          },
-        });
+        ctx.beginPath();
+        ctx.strokeStyle = isWater ? "rgba(0, 119, 190, 0.7)" : "rgba(30, 130, 76, 0.7)";
+        ctx.lineWidth = 5;
+        ctx.moveTo(startPt.x, startPt.y);
+        ctx.lineTo(endPt.x, endPt.y);
+        ctx.stroke();
       }
 
-      visionFeatures.push({
-        type: "Feature",
-        geometry: {
-          type: "Polygon",
-          coordinates: [createCircleGeoJSON(pos[0], pos[1], radius)],
-        },
-      });
+      const dest = waypoints[waypoints.length - 1];
+      const destPt = safeProject(dest[0], dest[1]);
+      const destRadiusPx = getMetersToPixels(map, dest[0], radius);
 
-      unitFeatures.push({
-        type: "Feature",
-        geometry: {
-          type: "Point",
-          coordinates: [pos[1], pos[0]],
-        },
-        properties: {
-          id: dot.id,
-          icon: isSelected ? `unit-icon-${dot.id}-selected` : `unit-icon-${dot.id}-normal`,
-          isSelected,
-          priority,
-        },
-      });
+      if (destPt && destRadiusPx > 0) {
+        ctx.beginPath();
+        ctx.setLineDash([6, 6]);
+        ctx.strokeStyle = OUR_TEAM_COLOR;
+        ctx.lineWidth = 2;
+        ctx.arc(destPt.x, destPt.y, destRadiusPx, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    });
+    ctx.restore();
+
+    // Pass B: Vision Circles
+    ctx.save();
+    dotsRef.current.forEach((dot) => {
+      const pt = safeProject(dot.pos[0], dot.pos[1]);
+      if (!pt) return;
+      const radiusPx = getMetersToPixels(map, dot.pos[0], dot.radius);
+
+      if (radiusPx > 0) {
+        ctx.beginPath();
+        ctx.arc(pt.x, pt.y, radiusPx, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(213, 0, 0, 0.22)";
+        ctx.fill();
+        ctx.strokeStyle = OUR_TEAM_COLOR;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+    });
+    ctx.restore();
+
+    // Pass C: Unit Icons
+    ctx.save();
+    dotsRef.current.forEach((dot) => {
+      const pt = safeProject(dot.pos[0], dot.pos[1]);
+      if (!pt) return;
+      const isSelected = dot.id === selectedIdRef.current;
+      const { canvas: texCanvas, displaySize } = getPrebakedCanvasTexture(dot.symbol, OUR_TEAM_COLOR, isSelected);
+
+      ctx.drawImage(
+        texCanvas,
+        pt.x - displaySize / 2,
+        pt.y - displaySize / 2,
+        displaySize,
+        displaySize
+      );
+    });
+    ctx.restore();
+  };
+
+  const drawFog = () => {
+    const canvas = fogCanvasRef.current;
+    const map = mapRef.current;
+    if (!map || !canvas || canvas.width === 0 || !isMapReadyRef.current || !unitsPlacedRef.current) {
+      if (canvas) {
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
+      return;
+    }
+
+    const ctx = canvas.getContext("2d");
+    const width = canvas.width;
+    const height = canvas.height;
+
+    ctx.globalCompositeOperation = "source-over";
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = "rgba(7, 14, 23, 0.72)";
+    ctx.fillRect(0, 0, width, height);
+
+    ctx.globalCompositeOperation = "destination-out";
+
+    dotsRef.current.forEach((dot) => {
+      const pt = safeProject(dot.pos[0], dot.pos[1]);
+      if (!pt) return;
+
+      const r400 = getMetersToPixels(map, dot.pos[0], 400);
+      const r600 = getMetersToPixels(map, dot.pos[0], 600);
+
+      if (r600 <= 0) return;
+
+      ctx.fillStyle = "rgba(0, 0, 0, 1)";
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, Math.max(0, r400), 0, Math.PI * 2);
+      ctx.fill();
+
+      const grad = ctx.createRadialGradient(pt.x, pt.y, Math.max(0, r400), pt.x, pt.y, r600);
+      grad.addColorStop(0, "rgba(0, 0, 0, 1)");
+      grad.addColorStop(1, "rgba(0, 0, 0, 0)");
+
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, r600, 0, Math.PI * 2);
+      ctx.fill();
     });
 
-    const pathSource = map.getSource("unit-paths");
-    if (pathSource) {
-      pathSource.setData({ type: "FeatureCollection", features: lineFeatures });
-    }
-
-    const ringSource = map.getSource("dest-rings");
-    if (ringSource) {
-      ringSource.setData({ type: "FeatureCollection", features: ringFeatures });
-    }
-
-    const visionSource = map.getSource("vision-circles");
-    if (visionSource) {
-      visionSource.setData({ type: "FeatureCollection", features: visionFeatures });
-    }
-
-    const unitSource = map.getSource("player-units");
-    if (unitSource) {
-      unitSource.setData({ type: "FeatureCollection", features: unitFeatures });
-    }
-
-    map.triggerRepaint();
+    ctx.globalCompositeOperation = "source-over";
   };
 
   // 1. Initialize MapLibre
@@ -441,7 +332,7 @@ export default function App() {
 
     const map = new MapConstructor({
       container: mapContainerRef.current,
-      style: BASE_STYLE,
+      style: SATELLITE_STYLE,
       center: [114.1694, 22.3193],
       zoom: 12,
       minZoom: 10,
@@ -451,13 +342,15 @@ export default function App() {
 
     mapRef.current = map;
 
+    const ro = new ResizeObserver(() => {
+      map.resize();
+      syncCanvasSize();
+    });
+    ro.observe(mapContainerRef.current);
+
     map.on("load", () => {
       isMapReadyRef.current = true;
-
-      DOT_CONFIGS.forEach((cfg) => {
-        map.addImage(`unit-icon-${cfg.id}-normal`, createEmojiImage(cfg.symbol, false));
-        map.addImage(`unit-icon-${cfg.id}-selected`, createEmojiImage(cfg.symbol, true));
-      });
+      syncCanvasSize();
 
       map.addSource("opponent-units", {
         type: "geojson",
@@ -484,96 +377,6 @@ export default function App() {
         },
       });
 
-      map.addSource("unit-paths", {
-        type: "geojson",
-        data: { type: "FeatureCollection", features: [] },
-      });
-
-      map.addLayer({
-        id: "unit-paths-layer",
-        type: "line",
-        source: "unit-paths",
-        layout: {
-          "line-join": "round",
-          "line-cap": "round",
-        },
-        paint: {
-          "line-width": 5,
-          "line-color": [
-            "case",
-            ["==", ["get", "isWater"], true],
-            "rgba(0, 119, 190, 0.7)",
-            "rgba(30, 130, 76, 0.7)",
-          ],
-        },
-      });
-
-      map.addSource("dest-rings", {
-        type: "geojson",
-        data: { type: "FeatureCollection", features: [] },
-      });
-
-      map.addLayer({
-        id: "dest-rings-layer",
-        type: "line",
-        source: "dest-rings",
-        paint: {
-          "line-color": OUR_TEAM_COLOR,
-          "line-width": 2,
-          "line-dasharray": [2, 2],
-        },
-      });
-
-      map.addSource("vision-circles", {
-        type: "geojson",
-        data: { type: "FeatureCollection", features: [] },
-      });
-
-      map.addLayer({
-        id: "vision-circles-fill",
-        type: "fill",
-        source: "vision-circles",
-        paint: {
-          "fill-color": OUR_TEAM_COLOR,
-          "fill-opacity": 0.22,
-        },
-      });
-
-      map.addLayer({
-        id: "vision-circles-stroke",
-        type: "line",
-        source: "vision-circles",
-        paint: {
-          "line-color": OUR_TEAM_COLOR,
-          "line-width": 1.5,
-        },
-      });
-
-      map.addLayer(createFogLayer(dotsRef, unitsPlacedRef));
-
-      map.addSource("player-units", {
-        type: "geojson",
-        data: { type: "FeatureCollection", features: [] },
-      });
-
-      map.addLayer({
-        id: "player-units-layer",
-        type: "symbol",
-        source: "player-units",
-        layout: {
-          "icon-image": ["get", "icon"],
-          "icon-size": [
-            "case",
-            ["==", ["get", "isSelected"], true],
-            0.45 * 1.1,
-            0.45,
-          ],
-          "icon-allow-overlap": true,
-          "icon-ignore-placement": true,
-          "symbol-sort-key": ["get", "priority"],
-        },
-      });
-
       initGraph()
         .then(async ({ bbox }) => {
           map.fitBounds(
@@ -586,7 +389,7 @@ export default function App() {
 
           const playerSnapPromises = dotsRef.current.map(() => {
             const randLat = bbox[0][0] + Math.random() * (bbox[1][0] - bbox[0][0]);
-            const randLon = bbox[0][1] + Math.random() * (bbox[1][0] - bbox[0][1]);
+            const randLon = bbox[0][1] + Math.random() * (bbox[1][1] - bbox[0][1]);
             return snap(randLat, randLon);
           });
 
@@ -596,12 +399,15 @@ export default function App() {
           });
           unitsPlacedRef.current = true;
 
+          syncCanvasSize();
+
+          // Opponents
           const opponentPromises = [];
           for (let teamIdx = 1; teamIdx < TEAM_COLORS.length; teamIdx++) {
             const teamColor = TEAM_COLORS[teamIdx];
             DOT_CONFIGS.forEach((cfg) => {
               const randLat = bbox[0][0] + Math.random() * (bbox[1][0] - bbox[0][0]);
-              const randLon = bbox[0][1] + Math.random() * (bbox[1][0] - bbox[0][1]);
+              const randLon = bbox[0][1] + Math.random() * (bbox[1][1] - bbox[0][1]);
               opponentPromises.push(
                 snap(randLat, randLon).then((res) => ({
                   pt: res.pt,
@@ -634,14 +440,15 @@ export default function App() {
     });
 
     return () => {
+      ro.disconnect();
       map.remove();
       mapRef.current = null;
       isMapReadyRef.current = false;
       unitsPlacedRef.current = false;
     };
-  }, []);
+  }, [syncCanvasSize]);
 
-  // 2. High-Performance Movement & Animation Game Loop
+  // 2. Game Loop
   useEffect(() => {
     let animId;
     let lastTime = performance.now();
@@ -652,18 +459,6 @@ export default function App() {
       lastTime = now;
 
       dotsRef.current.forEach((dot) => {
-        if (dot.radius < dot.targetRadius) {
-          dot.radius = Math.min(dot.targetRadius, dot.radius + 100.0 * dt);
-        } else if (dot.radius > dot.targetRadius) {
-          dot.radius = Math.max(dot.targetRadius, dot.radius - 100.0 * dt);
-        }
-
-        if (dot.sightRadius < dot.targetSightRadius) {
-          dot.sightRadius = Math.min(dot.targetSightRadius, dot.sightRadius + 1000.0 * dt);
-        } else if (dot.sightRadius > dot.targetSightRadius) {
-          dot.sightRadius = Math.max(dot.targetSightRadius, dot.sightRadius - 1000.0 * dt);
-        }
-
         const { state, waypoints } = dot;
         let segIdx = dot.segIdx;
 
@@ -728,7 +523,8 @@ export default function App() {
         }
       });
 
-      syncMapGraphics();
+      drawDynamicElements();
+      drawFog();
 
       if (now - lastUIUpdate > 100) {
         setDotsUI(
@@ -741,8 +537,7 @@ export default function App() {
             timeLeft: d.timeLeft,
             distLeft: d.distLeft,
             speed: d.speed,
-            radius: Math.round(d.targetRadius),
-            sightRadius: Math.round(d.targetSightRadius),
+            radius: d.radius,
           }))
         );
         lastUIUpdate = now;
@@ -765,17 +560,11 @@ export default function App() {
     } else {
       selectedIdRef.current = id;
       setSelectedId(id);
-
-      const currentHistory = selectionHistoryRef.current.filter((item) => item !== id);
-      selectionHistoryRef.current = [id, ...currentHistory];
-
       const dot = dotsRef.current[id];
       if (dot) {
         map.panTo([dot.pos[1], dot.pos[0]], { duration: 400 });
       }
     }
-
-    syncMapGraphics();
   };
 
   // Map Click Rerouting
@@ -877,50 +666,10 @@ export default function App() {
     if (dot) dot.speed += 5.0;
   };
 
-  const handleAddReach = (id, e) => {
+  const handleAddRadius = (id, e) => {
     e.stopPropagation();
     const dot = dotsRef.current[id];
-    if (dot) {
-      dot.targetRadius = (dot.targetRadius || dot.radius) + 10;
-    }
-  };
-
-  const handleAddSight = (id, e) => {
-    e.stopPropagation();
-    const dot = dotsRef.current[id];
-    if (dot) {
-      dot.targetSightRadius = (dot.targetSightRadius || dot.sightRadius || 600) + 100;
-    }
-  };
-
-  const handleStop = (id, e) => {
-    e.stopPropagation();
-    const dot = dotsRef.current[id];
-    if (!dot || dot.state === "Stop") return;
-
-    if (dot.state === "Move") {
-      dot.state = "Stop";
-      dot.waypoints = [];
-      dot.waterFlags = [];
-      dot.segIdx = 0;
-      dot.ferryTarget = null;
-      dot.timeLeft = "--";
-      dot.eta = "--";
-      dot.distLeft = "--";
-    } else if (dot.state === "Ferry" || (dot.state === "Redirecting" && dot.waterFlags[dot.segIdx] === 1)) {
-      const { waypoints, waterFlags, segIdx } = dot;
-      let landNodeIdx = waypoints.length - 1;
-      for (let i = segIdx; i < waterFlags.length; i++) {
-        if (waterFlags[i] === 0) {
-          landNodeIdx = i;
-          break;
-        }
-      }
-
-      dot.waypoints = waypoints.slice(0, landNodeIdx + 1);
-      dot.waterFlags = waterFlags.slice(0, landNodeIdx);
-      dot.ferryTarget = null;
-    }
+    if (dot) dot.radius += 10;
   };
 
   const handleTeleport = (id, e) => {
@@ -957,7 +706,7 @@ export default function App() {
         backgroundColor: "#1a1a1a",
       }}
     >
-      {/* 1. Fully GPU-Accelerated WebGL Map */}
+      {/* 1. Underlying MapLibre GL WebGL Map */}
       <div
         ref={mapContainerRef}
         style={{
@@ -970,42 +719,35 @@ export default function App() {
         }}
       />
 
-      {/* 2. Top-Left Basemap Toggle Button */}
-      <div
+      {/* 2. Paths & Units Canvas Layer */}
+      <canvas
+        ref={pathsCanvasRef}
         style={{
           position: "absolute",
-          top: "calc(16px + env(safe-area-inset-top, 0px))",
-          left: 16,
-          zIndex: 40,
+          top: 0,
+          left: 0,
+          width: "100%",
+          height: "100%",
+          pointerEvents: "none",
+          zIndex: 10,
         }}
-      >
-        <button
-          onClick={toggleMapMode}
-          style={{
-            backgroundColor: "#ffffff",
-            color: "#111827",
-            border: "1px solid rgba(0, 0, 0, 0.1)",
-            padding: "8px 14px",
-            borderRadius: "8px",
-            fontSize: "13px",
-            fontWeight: 600,
-            cursor: "pointer",
-            boxShadow: "0 2px 8px rgba(0, 0, 0, 0.2)",
-            display: "flex",
-            alignItems: "center",
-            gap: "6px",
-            userSelect: "none",
-            outline: "none",
-            transition: "all 0.15s ease",
-          }}
-          onMouseDown={(e) => (e.currentTarget.style.transform = "scale(0.97)")}
-          onMouseUp={(e) => (e.currentTarget.style.transform = "scale(1)")}
-        >
-          {mapMode === "satellite" ? "🗺️ Map View" : "🛰️ Satellite View"}
-        </button>
-      </div>
+      />
 
-      {/* 3. Left-Hand Unit Selection Toolbar */}
+      {/* 3. Fog of War Canvas Layer */}
+      <canvas
+        ref={fogCanvasRef}
+        style={{
+          position: "absolute",
+          top: 0,
+          left: 0,
+          width: "100%",
+          height: "100%",
+          pointerEvents: "none",
+          zIndex: 20,
+        }}
+      />
+
+      {/* 4. Left-Hand Unit Selection Toolbar */}
       <div
         style={{
           position: "absolute",
@@ -1050,7 +792,7 @@ export default function App() {
         })}
       </div>
 
-      {/* 4. Bottom Tactical Card */}
+      {/* 5. Bottom Tactical Card */}
       <div
         style={{
           position: "absolute",
@@ -1118,31 +860,12 @@ export default function App() {
                 <b>{selectedDotUI.speed} m/s</b>
               </div>
               <div style={{ fontSize: "12px", color: "#333" }}>
-                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Reach</span>
+                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Radius</span>
                 <b>{selectedDotUI.radius} m</b>
-              </div>
-              <div style={{ fontSize: "12px", color: "#333" }}>
-                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Halo Sight</span>
-                <b>{selectedDotUI.sightRadius} m</b>
               </div>
             </div>
 
             <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-              <button
-                onClick={(e) => handleStop(selectedDotUI.id, e)}
-                style={{
-                  padding: "5px 10px",
-                  background: "#dc3545",
-                  color: "#fff",
-                  border: "none",
-                  borderRadius: "14px",
-                  fontSize: "11px",
-                  fontWeight: "bold",
-                  cursor: "pointer",
-                }}
-              >
-                Stop
-              </button>
               <button
                 onClick={(e) => handleAddSpeed(selectedDotUI.id, e)}
                 style={{
@@ -1159,7 +882,7 @@ export default function App() {
                 +5ms⁻¹
               </button>
               <button
-                onClick={(e) => handleAddReach(selectedDotUI.id, e)}
+                onClick={(e) => handleAddRadius(selectedDotUI.id, e)}
                 style={{
                   padding: "5px 10px",
                   background: "#0dcaf0",
@@ -1172,21 +895,6 @@ export default function App() {
                 }}
               >
                 +10m
-              </button>
-              <button
-                onClick={(e) => handleAddSight(selectedDotUI.id, e)}
-                style={{
-                  padding: "5px 10px",
-                  background: "#ffc107",
-                  color: "#000",
-                  border: "none",
-                  borderRadius: "14px",
-                  fontSize: "11px",
-                  fontWeight: "bold",
-                  cursor: "pointer",
-                }}
-              >
-                +100m
               </button>
               <button
                 onClick={(e) => handleTeleport(selectedDotUI.id, e)}
