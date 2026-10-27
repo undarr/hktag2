@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { initGraph, snap, pathfind } from "./fetch";
+maplibregl.workerUrl = "/maplibre-gl-worker.mjs";
 
 const SATELLITE_STYLE = {
   version: 8,

@@ -1,2 +1,0 @@
-/*
-  Content-Security-Policy: default-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: https:; worker-src 'self' blob:; child-src 'self' blob:; connect-src 'self' blob: https://*.arcgisonline.com https://*.openfreemap.org;
