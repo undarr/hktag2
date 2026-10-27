@@ -26,13 +26,13 @@ const SATELLITE_STYLE = {
   ],
 };
 
+const MAP_STYLE = "https://tiles.openfreemap.org/styles/liberty";
+
 const TEAM_COLORS = [
   "#D50000", "#FF5500", "#C87800", "#008828",
   "#5EA800", "#0088D6", "#002BFF", "#5500FF",
   "#FF1464", "#7B3800", "#66002A", "#003866",
 ];
-
-const OUR_TEAM_COLOR = TEAM_COLORS[0];
 
 const DOT_CONFIGS = [
   { id: 0, symbol: "👮", name: "Officer" },
@@ -59,7 +59,6 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Generate circular polygon GeoJSON for unit vision bounds / destinations
 function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 32) {
   const coords = [];
   const km = radiusMeters / 1000.0;
@@ -84,7 +83,7 @@ function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 32) {
   return coords;
 }
 
-// Custom WebGL Fog-of-War Layer
+// Custom WebGL Fog-of-War Layer with Seamless Halo Blending
 function createFogLayer(dotsRef, unitsPlacedRef) {
   return {
     id: "fog-of-war-layer",
@@ -109,30 +108,50 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
         uniform float u_radii[4];
         uniform int u_unit_count;
 
+        // Polynomial smooth maximum for organic gradient blending
+        float smax(float a, float b, float k) {
+          float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+          return mix(a, b, h) + k * h * (1.0 - h);
+        }
+
         void main() {
           vec2 fragCoord = gl_FragCoord.xy;
-          // Flip Y to match viewport coordinates
           fragCoord.y = u_resolution.y - fragCoord.y;
 
-          float minFog = 0.72; // Fog opacity (alpha)
+          // Pass 1: If inside the bright (inner) region of ANY halo, clear completely.
+          // The gradient of any other circle is not allowed to exist here.
+          for (int i = 0; i < 4; i++) {
+            if (i >= u_unit_count) break;
+            float d = distance(fragCoord, u_centers[i]);
+            float rInner = u_radii[i] * (400.0 / 600.0);
+            if (d <= rInner) {
+              discard;
+            }
+          }
 
+          // Pass 2: Smoothly evaluate clear visibility from all halos outside the bright cores
+          float maxVis = 0.0;
           for (int i = 0; i < 4; i++) {
             if (i >= u_unit_count) break;
             float d = distance(fragCoord, u_centers[i]);
             float rInner = u_radii[i] * (400.0 / 600.0);
             float rOuter = u_radii[i];
 
-            if (d < rInner) {
-              minFog = 0.0;
-            } else if (d < rOuter) {
-              float factor = (d - rInner) / (rOuter - rInner);
-              minFog = min(minFog, factor * 0.72);
+            if (d < rOuter) {
+              // Smooth Hermite interpolation from inner (1.0 visibility) to outer (0.0 visibility)
+              // Guarantees zero derivative at boundary lines
+              float vis = 1.0 - smoothstep(rInner, rOuter, d);
+              maxVis = smax(maxVis, vis, 0.08);
             }
           }
 
-          if (minFog <= 0.0) {
+          maxVis = clamp(maxVis, 0.0, 1.0);
+          float minFog = 0.72 * (1.0 - maxVis);
+
+          if (minFog <= 0.002) {
             discard;
           }
+
           gl_FragColor = vec4(0.027, 0.054, 0.090, minFog);
         }
       `;
@@ -156,7 +175,6 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
       this.uRadii = gl.getUniformLocation(prog, "u_radii[0]");
       this.uCount = gl.getUniformLocation(prog, "u_unit_count");
 
-      // Fullscreen quad
       this.vertexBuffer = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
       gl.bufferData(
@@ -166,9 +184,18 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
       );
     },
 
-    render(gl) {
-      if (!unitsPlacedRef.current) return;
+    onRemove(map, gl) {
+      if (this.program) {
+        gl.deleteProgram(this.program);
+        this.program = null;
+      }
+      if (this.vertexBuffer) {
+        gl.deleteBuffer(this.vertexBuffer);
+        this.vertexBuffer = null;
+      }
+    },
 
+    render(gl) {
       gl.useProgram(this.program);
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -179,25 +206,31 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
       const height = canvas.height;
 
       gl.uniform2f(this.uRes, width, height);
-      gl.uniform1i(this.uCount, dotsRef.current.length);
 
-      const centers = [];
-      const radii = [];
+      if (!unitsPlacedRef.current) {
+        gl.uniform1i(this.uCount, 0);
+      } else {
+        gl.uniform1i(this.uCount, dotsRef.current.length);
 
-      dotsRef.current.forEach((dot) => {
-        const pt = map.project([dot.pos[1], dot.pos[0]]);
-        // Multiply by devicePixelRatio for high-DPI screens
+        const centers = [];
+        const radii = [];
         const dpr = window.devicePixelRatio || 1;
-        centers.push(pt.x * dpr, pt.y * dpr);
-
-        const latRad = dot.pos[0] * (Math.PI / 180);
         const zoom = map.getZoom();
-        const metersPerPx = (40075016.686 * Math.cos(latRad)) / (512 * Math.pow(2, zoom));
-        radii.push((600 / metersPerPx) * dpr);
-      });
 
-      gl.uniform2fv(this.uCenters, new Float32Array(centers));
-      gl.uniform1fv(this.uRadii, new Float32Array(radii));
+        dotsRef.current.forEach((dot) => {
+          const pt = map.project([dot.pos[1], dot.pos[0]]);
+          centers.push(pt.x * dpr, pt.y * dpr);
+
+          const latRad = dot.pos[0] * (Math.PI / 180);
+          const metersPerPx = (40075016.686 * Math.cos(latRad)) / (512 * Math.pow(2, zoom));
+          const sightMeters = dot.sight || 600.0;
+          const pxRadius = Math.max(3.0 * dpr, (sightMeters / metersPerPx) * dpr);
+          radii.push(pxRadius);
+        });
+
+        gl.uniform2fv(this.uCenters, new Float32Array(centers));
+        gl.uniform1fv(this.uRadii, new Float32Array(radii));
+      }
 
       gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
       gl.enableVertexAttribArray(this.aPos);
@@ -214,6 +247,15 @@ export default function App() {
   const isMapReadyRef = useRef(false);
   const unitsPlacedRef = useRef(false);
   const markersRef = useRef(new Map());
+  const opponentFeaturesRef = useRef([]);
+
+  const [ourTeamColor] = useState(() => TEAM_COLORS[Math.floor(Math.random() * TEAM_COLORS.length)]);
+  const ourTeamColorRef = useRef(ourTeamColor);
+  ourTeamColorRef.current = ourTeamColor;
+
+  const [isSatellite, setIsSatellite] = useState(true);
+  const isSatelliteRef = useRef(true);
+  isSatelliteRef.current = isSatellite;
 
   const [selectedId, setSelectedId] = useState(null);
   const selectedIdRef = useRef(null);
@@ -229,6 +271,7 @@ export default function App() {
       distLeft: "--",
       speed: 20.0,
       radius: 25,
+      sight: 600,
     }))
   );
 
@@ -239,8 +282,11 @@ export default function App() {
       symbol: cfg.symbol,
       pos: [22.3193, 114.1694],
       state: "Stop",
+      preRedirectState: null,
+      redirectRequestId: 0,
       speed: 20.0,
       radius: 25,
+      sight: 600,
       waypoints: [],
       waterFlags: [],
       segIdx: 0,
@@ -251,12 +297,11 @@ export default function App() {
     }))
   );
 
-  // Synchronize dynamic GPU layers with game state
   const syncMapGraphics = () => {
     const map = mapRef.current;
     if (!map || !isMapReadyRef.current) return;
 
-    // 1. Update native HTML Unit Markers
+    // 1. Update HTML Unit Markers
     dotsRef.current.forEach((dot) => {
       const marker = markersRef.current.get(dot.id);
       if (marker) {
@@ -264,7 +309,7 @@ export default function App() {
       }
     });
 
-    // 2. Build Paths & Destination Rings GeoJSON
+    // 2. Build continuous multi-point paths
     const lineFeatures = [];
     const ringFeatures = [];
     const visionFeatures = [];
@@ -272,25 +317,48 @@ export default function App() {
     dotsRef.current.forEach((dot) => {
       const { waypoints, waterFlags, segIdx, pos, radius } = dot;
 
-      // Active path lines
       if (waypoints && waypoints.length > 1 && segIdx < waypoints.length - 1) {
-        for (let i = segIdx; i < waypoints.length - 1; i++) {
-          const start = i === segIdx ? [pos[1], pos[0]] : [waypoints[i][1], waypoints[i][0]];
-          const end = [waypoints[i + 1][1], waypoints[i + 1][0]];
+        let currentWater = waterFlags[segIdx] === 1;
+        let currentCoords = [
+          [pos[1], pos[0]],
+          [waypoints[segIdx + 1][1], waypoints[segIdx + 1][0]],
+        ];
 
+        for (let i = segIdx + 1; i < waypoints.length - 1; i++) {
+          const isWater = waterFlags[i] === 1;
+          const nextPt = [waypoints[i + 1][1], waypoints[i + 1][0]];
+
+          if (isWater === currentWater) {
+            currentCoords.push(nextPt);
+          } else {
+            lineFeatures.push({
+              type: "Feature",
+              geometry: {
+                type: "LineString",
+                coordinates: currentCoords,
+              },
+              properties: {
+                isWater: currentWater,
+              },
+            });
+            currentWater = isWater;
+            currentCoords = [[waypoints[i][1], waypoints[i][0]], nextPt];
+          }
+        }
+
+        if (currentCoords.length >= 2) {
           lineFeatures.push({
             type: "Feature",
             geometry: {
               type: "LineString",
-              coordinates: [start, end],
+              coordinates: currentCoords,
             },
             properties: {
-              isWater: waterFlags[i] === 1,
+              isWater: currentWater,
             },
           });
         }
 
-        // Destination target ring
         const dest = waypoints[waypoints.length - 1];
         ringFeatures.push({
           type: "Feature",
@@ -301,7 +369,6 @@ export default function App() {
         });
       }
 
-      // Friendly unit vision circle
       visionFeatures.push({
         type: "Feature",
         geometry: {
@@ -326,35 +393,40 @@ export default function App() {
       visionSource.setData({ type: "FeatureCollection", features: visionFeatures });
     }
 
-    // Force custom WebGL layer redraw
     map.triggerRepaint();
   };
 
-  // 1. Initialize MapLibre
-  useEffect(() => {
-    if (!mapContainerRef.current) return;
+  const setupLayers = (map) => {
+    if (!map) return;
+    const teamColor = ourTeamColorRef.current;
 
-    const MapConstructor = maplibregl.Map || maplibregl.default?.Map;
+    if (!map.getSource("satellite-tiles")) {
+      map.addSource("satellite-tiles", {
+        type: "raster",
+        tiles: [
+          "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        ],
+        tileSize: 256,
+        maxzoom: 19,
+      });
 
-    const map = new MapConstructor({
-      container: mapContainerRef.current,
-      style: SATELLITE_STYLE,
-      center: [114.1694, 22.3193],
-      zoom: 12,
-      minZoom: 10,
-      maxZoom: 19,
-      attributionControl: false,
-    });
+      map.addLayer({
+        id: "satellite-layer",
+        type: "raster",
+        source: "satellite-tiles",
+        minzoom: 0,
+        maxzoom: 22,
+        layout: {
+          visibility: isSatelliteRef.current ? "visible" : "none",
+        },
+      });
+    }
 
-    mapRef.current = map;
-
-    map.on("load", () => {
-      isMapReadyRef.current = true;
-
-      // Opponents Source & Layer
+    if (!map.getSource("opponent-units")) {
       map.addSource("opponent-units", {
         type: "geojson",
-        data: { type: "FeatureCollection", features: [] },
+        data: { type: "FeatureCollection", features: opponentFeaturesRef.current },
+        tolerance: 0,
       });
 
       map.addLayer({
@@ -366,71 +438,93 @@ export default function App() {
             "interpolate",
             ["exponential", 2],
             ["zoom"],
-            10, 1,
+            1, 2,
+            10, 5,
             20, 200,
           ],
           "circle-color": ["get", "color"],
-          "circle-opacity": 0.15,
+          "circle-opacity": 0.25,
           "circle-stroke-width": 1.5,
           "circle-stroke-color": ["get", "color"],
-          "circle-stroke-opacity": 0.5,
+          "circle-stroke-opacity": 0.8,
         },
       });
+    }
 
-      // Unit Paths Source & Line Layer (GPU-rendered)
+    if (!map.getSource("unit-paths")) {
       map.addSource("unit-paths", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
+        tolerance: 0,
+        buffer: 128,
       });
 
       map.addLayer({
         id: "unit-paths-layer",
         type: "line",
         source: "unit-paths",
+        minzoom: 0,
+        maxzoom: 24,
         layout: {
           "line-join": "round",
           "line-cap": "round",
         },
         paint: {
-          "line-width": 5,
+          "line-width": [
+            "interpolate",
+            ["linear"],
+            ["zoom"],
+            1, 2.5,
+            6, 3.5,
+            12, 5,
+            18, 7,
+          ],
           "line-color": [
             "case",
             ["==", ["get", "isWater"], true],
-            "rgba(0, 119, 190, 0.7)",
-            "rgba(30, 130, 76, 0.7)",
+            "rgba(0, 119, 190, 0.85)",
+            "rgba(30, 130, 76, 0.85)",
           ],
         },
       });
+    }
 
-      // Destination Rings Layer
+    if (!map.getSource("dest-rings")) {
       map.addSource("dest-rings", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
+        tolerance: 0,
       });
 
       map.addLayer({
         id: "dest-rings-layer",
         type: "line",
         source: "dest-rings",
+        minzoom: 0,
+        maxzoom: 24,
         paint: {
-          "line-color": OUR_TEAM_COLOR,
+          "line-color": teamColor,
           "line-width": 2,
           "line-dasharray": [2, 2],
         },
       });
+    }
 
-      // Friendly Unit Vision Rings
+    if (!map.getSource("vision-circles")) {
       map.addSource("vision-circles", {
         type: "geojson",
         data: { type: "FeatureCollection", features: [] },
+        tolerance: 0,
       });
 
       map.addLayer({
         id: "vision-circles-fill",
         type: "fill",
         source: "vision-circles",
+        minzoom: 0,
+        maxzoom: 24,
         paint: {
-          "fill-color": OUR_TEAM_COLOR,
+          "fill-color": teamColor,
           "fill-opacity": 0.22,
         },
       });
@@ -439,16 +533,49 @@ export default function App() {
         id: "vision-circles-stroke",
         type: "line",
         source: "vision-circles",
+        minzoom: 0,
+        maxzoom: 24,
         paint: {
-          "line-color": OUR_TEAM_COLOR,
+          "line-color": teamColor,
           "line-width": 1.5,
         },
       });
+    }
 
-      // Add Custom GPU Fog Layer
+    if (!map.getLayer("fog-of-war-layer")) {
       map.addLayer(createFogLayer(dotsRef, unitsPlacedRef));
+    }
 
-      // Build Marker DOM nodes for player units
+    syncMapGraphics();
+  };
+
+  useEffect(() => {
+    if (!mapContainerRef.current) return;
+
+    const MapConstructor = maplibregl.Map || maplibregl.default?.Map;
+
+    const map = new MapConstructor({
+      container: mapContainerRef.current,
+      style: MAP_STYLE,
+      center: [114.1694, 22.3193],
+      zoom: 12,
+      minZoom: 1,
+      maxZoom: 19,
+      attributionControl: false,
+    });
+
+    mapRef.current = map;
+
+    map.on("styledata", () => {
+      if (map.isStyleLoaded()) {
+        setupLayers(map);
+      }
+    });
+
+    map.on("load", () => {
+      isMapReadyRef.current = true;
+      setupLayers(map);
+
       dotsRef.current.forEach((dot) => {
         const el = document.createElement("div");
         el.id = `marker-unit-${dot.id}`;
@@ -460,7 +587,7 @@ export default function App() {
         el.style.alignItems = "center";
         el.style.justifyContent = "center";
         el.style.userSelect = "none";
-        el.style.filter = `drop-shadow(0 0 6px ${OUR_TEAM_COLOR})`;
+        el.style.filter = `drop-shadow(0 0 6px ${ourTeamColorRef.current})`;
         el.style.cursor = "pointer";
 
         const MarkerClass = maplibregl.Marker || maplibregl.default?.Marker;
@@ -471,7 +598,6 @@ export default function App() {
         markersRef.current.set(dot.id, marker);
       });
 
-      // Initialize Game Graph
       initGraph()
         .then(async ({ bbox }) => {
           map.fitBounds(
@@ -494,10 +620,10 @@ export default function App() {
           });
           unitsPlacedRef.current = true;
 
-          // Opponents
+          const opponentTeamColors = TEAM_COLORS.filter((c) => c !== ourTeamColorRef.current);
           const opponentPromises = [];
-          for (let teamIdx = 1; teamIdx < TEAM_COLORS.length; teamIdx++) {
-            const teamColor = TEAM_COLORS[teamIdx];
+
+          opponentTeamColors.forEach((tColor) => {
             DOT_CONFIGS.forEach((cfg) => {
               const randLat = bbox[0][0] + Math.random() * (bbox[1][0] - bbox[0][0]);
               const randLon = bbox[0][1] + Math.random() * (bbox[1][0] - bbox[0][1]);
@@ -505,11 +631,11 @@ export default function App() {
                 snap(randLat, randLon).then((res) => ({
                   pt: res.pt,
                   symbol: cfg.symbol,
-                  teamColor,
+                  teamColor: tColor,
                 }))
               );
             });
-          }
+          });
 
           const opponentUnits = await Promise.all(opponentPromises);
           const features = opponentUnits.map(({ pt, teamColor }) => ({
@@ -521,6 +647,7 @@ export default function App() {
             properties: { color: teamColor },
           }));
 
+          opponentFeaturesRef.current = features;
           const src = map.getSource("opponent-units");
           if (src) {
             src.setData({
@@ -542,7 +669,7 @@ export default function App() {
     };
   }, []);
 
-  // 2. High-Performance Movement Game Loop
+  // 60 FPS Movement Loop
   useEffect(() => {
     let animId;
     let lastTime = performance.now();
@@ -600,6 +727,10 @@ export default function App() {
           if (segIdx >= waypoints.length - 1) {
             dot.state = "Stop";
             dot.waypoints = [];
+            dot.waterFlags = [];
+            dot.segIdx = 0;
+            dot.ferryTarget = null;
+            dot.preRedirectState = null;
             dot.timeLeft = "--";
             dot.eta = "--";
             dot.distLeft = "--";
@@ -617,10 +748,8 @@ export default function App() {
         }
       });
 
-      // Update WebGL Graphics and Markers
       syncMapGraphics();
 
-      // UI throttle to 10 FPS
       if (now - lastUIUpdate > 100) {
         setDotsUI(
           dotsRef.current.map((d) => ({
@@ -633,6 +762,7 @@ export default function App() {
             distLeft: d.distLeft,
             speed: d.speed,
             radius: d.radius,
+            sight: d.sight,
           }))
         );
         lastUIUpdate = now;
@@ -645,15 +775,20 @@ export default function App() {
     return () => cancelAnimationFrame(animId);
   }, []);
 
-  // Update selected unit marker style
   useEffect(() => {
+    const color = ourTeamColorRef.current;
     markersRef.current.forEach((marker, id) => {
       const el = marker.getElement();
       if (id === selectedId) {
-        el.style.filter = "drop-shadow(0 0 10px #ffffff) drop-shadow(0 0 5px #D50000)";
-        el.style.transform += " scale(1.2)";
+        el.style.filter = `drop-shadow(0 0 10px ${color}) drop-shadow(0 0 18px ${color}) drop-shadow(0 0 5px ${color})`;
+        el.style.fontSize = "32px";
+        el.style.width = "50px";
+        el.style.height = "50px";
       } else {
-        el.style.filter = `drop-shadow(0 0 6px ${OUR_TEAM_COLOR})`;
+        el.style.filter = `drop-shadow(0 0 6px ${color})`;
+        el.style.fontSize = "24px";
+        el.style.width = "40px";
+        el.style.height = "40px";
       }
     });
   }, [selectedId]);
@@ -675,7 +810,20 @@ export default function App() {
     }
   };
 
-  // Map Click Rerouting
+  const handleToggleStyle = () => {
+    const map = mapRef.current;
+    if (!map) return;
+    const nextSatellite = !isSatellite;
+    setIsSatellite(nextSatellite);
+    isSatelliteRef.current = nextSatellite;
+
+    if (map.getLayer("satellite-layer")) {
+      map.setLayoutProperty("satellite-layer", "visibility", nextSatellite ? "visible" : "none");
+    } else {
+      map.setStyle(nextSatellite ? SATELLITE_STYLE : MAP_STYLE);
+    }
+  };
+
   useEffect(() => {
     if (!mapRef.current) return;
 
@@ -693,6 +841,10 @@ export default function App() {
       const waypoints = dot.waypoints;
       const flags = dot.waterFlags;
       const curSeg = dot.segIdx;
+
+      dot.preRedirectState = curState;
+      dot.redirectRequestId = (dot.redirectRequestId || 0) + 1;
+      const reqId = dot.redirectRequestId;
 
       dot.redirectStart = performance.now();
 
@@ -712,6 +864,8 @@ export default function App() {
         const snapC = await snap(clickLat, clickLon);
         const snapB = await snap(nodeBCoord[0], nodeBCoord[1]);
         const { flatPolyline: bToCFlat, waterFlags: bToCFlags } = await pathfind(snapB, snapC);
+
+        if (dot.redirectRequestId !== reqId || dot.state !== "Redirecting") return;
 
         const bToCWaypoints = [];
         for (let i = 0; i < bToCFlat.length; i += 2) {
@@ -737,6 +891,7 @@ export default function App() {
         dot.segIdx = 0;
         dot.pos = newWaypoints[0];
         dot.ferryTarget = null;
+        dot.preRedirectState = null;
 
         dot.nextAllowedClick = performance.now() + 200;
         dot.state = newFlags[0] === 1 ? "Ferry" : "Move";
@@ -748,6 +903,8 @@ export default function App() {
         const snapStart = await snap(startPos[0], startPos[1]);
         const { flatPolyline, waterFlags } = await pathfind(snapStart, snapC);
 
+        if (dot.redirectRequestId !== reqId || dot.state !== "Redirecting") return;
+
         const newWaypoints = [];
         for (let i = 0; i < flatPolyline.length; i += 2) {
           newWaypoints.push([flatPolyline[i], flatPolyline[i + 1]]);
@@ -757,6 +914,7 @@ export default function App() {
         dot.waterFlags = Array.from(waterFlags);
         dot.segIdx = 0;
         dot.pos = newWaypoints[0];
+        dot.preRedirectState = null;
 
         dot.nextAllowedClick = performance.now() + 200;
         dot.state = waterFlags[0] === 1 ? "Ferry" : "Move";
@@ -780,6 +938,15 @@ export default function App() {
     if (dot) dot.radius += 10;
   };
 
+  const handleAddSight = (id, e) => {
+    e.stopPropagation();
+    const dot = dotsRef.current[id];
+    if (dot) {
+      dot.sight = (dot.sight || 600) + 100;
+      syncMapGraphics();
+    }
+  };
+
   const handleTeleport = (id, e) => {
     e.stopPropagation();
     const dot = dotsRef.current[id];
@@ -792,10 +959,69 @@ export default function App() {
     dot.waterFlags = [];
     dot.segIdx = 0;
     dot.ferryTarget = null;
+    dot.preRedirectState = null;
     dot.state = "Stop";
     dot.timeLeft = "--";
     dot.eta = "--";
     dot.distLeft = "--";
+  };
+
+  const handleStop = (id, e) => {
+    e.stopPropagation();
+    const dot = dotsRef.current[id];
+    if (!dot) return;
+
+    dot.redirectRequestId = (dot.redirectRequestId || 0) + 1;
+
+    const currentState = dot.state;
+    const effectiveState =
+      currentState === "Redirecting" ? dot.preRedirectState || "Move" : currentState;
+
+    if (effectiveState === "Ferry") {
+      const waypoints = dot.waypoints;
+      const flags = dot.waterFlags;
+      const curSeg = dot.segIdx;
+
+      let bIdx = waypoints.length - 1;
+      for (let i = curSeg; i < flags.length; i++) {
+        if (flags[i] === 0) {
+          bIdx = i;
+          break;
+        }
+      }
+
+      if (waypoints.length > 0 && bIdx < waypoints.length) {
+        dot.waypoints = waypoints.slice(0, bIdx + 1);
+        dot.waterFlags = flags.slice(0, bIdx);
+      }
+
+      dot.ferryTarget = null;
+      dot.preRedirectState = null;
+
+      if (dot.segIdx >= dot.waypoints.length - 1) {
+        dot.state = "Stop";
+        dot.waypoints = [];
+        dot.waterFlags = [];
+        dot.segIdx = 0;
+        dot.timeLeft = "--";
+        dot.eta = "--";
+        dot.distLeft = "--";
+      } else {
+        dot.state = "Ferry";
+      }
+    } else {
+      dot.state = "Stop";
+      dot.waypoints = [];
+      dot.waterFlags = [];
+      dot.segIdx = 0;
+      dot.ferryTarget = null;
+      dot.preRedirectState = null;
+      dot.timeLeft = "--";
+      dot.eta = "--";
+      dot.distLeft = "--";
+    }
+
+    syncMapGraphics();
   };
 
   const selectedDotUI = dotsUI.find((d) => d.id === selectedId);
@@ -807,14 +1033,13 @@ export default function App() {
         top: 0,
         left: 0,
         width: "100vw",
-        height: "100vh",
+        height: "100dvh",
         margin: 0,
         padding: 0,
         overflow: "hidden",
         backgroundColor: "#1a1a1a",
       }}
     >
-      {/* 1. Hardware Accelerated MapLibre GL WebGL Map Container */}
       <div
         ref={mapContainerRef}
         style={{
@@ -827,7 +1052,36 @@ export default function App() {
         }}
       />
 
-      {/* 2. Left-Hand Unit Selection Toolbar */}
+      {/* Top-Left Style Toggle Button */}
+      <button
+        onClick={handleToggleStyle}
+        style={{
+          position: "absolute",
+          top: "calc(16px + env(safe-area-inset-top, 0px))",
+          left: 16,
+          zIndex: 40,
+          width: "48px",
+          height: "48px",
+          borderRadius: "50%",
+          backgroundColor: "#ffffff",
+          boxShadow: "0 2px 8px rgba(0, 0, 0, 0.25)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontSize: "22px",
+          cursor: "pointer",
+          border: "none",
+          outline: "none",
+          userSelect: "none",
+          padding: 0,
+          transition: "transform 0.15s ease",
+        }}
+        title={isSatellite ? "Switch to Map" : "Switch to Satellite"}
+      >
+        {isSatellite ? "🗺️" : "🌍"}
+      </button>
+
+      {/* Left-Hand Unit Selection Toolbar */}
       <div
         style={{
           position: "absolute",
@@ -872,7 +1126,7 @@ export default function App() {
         })}
       </div>
 
-      {/* 3. Bottom Tactical Card */}
+      {/* Bottom Tactical Card */}
       <div
         style={{
           position: "absolute",
@@ -940,8 +1194,12 @@ export default function App() {
                 <b>{selectedDotUI.speed} m/s</b>
               </div>
               <div style={{ fontSize: "12px", color: "#333" }}>
-                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Radius</span>
+                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Reach</span>
                 <b>{selectedDotUI.radius} m</b>
+              </div>
+              <div style={{ fontSize: "12px", color: "#333" }}>
+                <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Sight</span>
+                <b>{selectedDotUI.sight} m</b>
               </div>
             </div>
 
@@ -977,6 +1235,21 @@ export default function App() {
                 +10m
               </button>
               <button
+                onClick={(e) => handleAddSight(selectedDotUI.id, e)}
+                style={{
+                  padding: "5px 10px",
+                  background: "#20c997",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: "14px",
+                  fontSize: "11px",
+                  fontWeight: "bold",
+                  cursor: "pointer",
+                }}
+              >
+                +100m
+              </button>
+              <button
                 onClick={(e) => handleTeleport(selectedDotUI.id, e)}
                 style={{
                   padding: "5px 10px",
@@ -990,6 +1263,21 @@ export default function App() {
                 }}
               >
                 TP
+              </button>
+              <button
+                onClick={(e) => handleStop(selectedDotUI.id, e)}
+                style={{
+                  padding: "5px 12px",
+                  background: "#dc3545",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: "14px",
+                  fontSize: "11px",
+                  fontWeight: "bold",
+                  cursor: "pointer",
+                }}
+              >
+                Stop
               </button>
               <button
                 onClick={() => handleToggleSelect(selectedDotUI.id)}
