@@ -42,42 +42,43 @@ const ZONE_CENTERS = (() => {
 const toSec = (h, m) => h * 3600 + m * 60;
 
 // Timeline config (06:00 -> 18:00)
+// nextTargetR and nextTargetCenter are retained during shrink so preview circle persists until shrinking ends
 const TIMELINE = [
   // Phase 1 (Initial R: 37,211.51m -> Target R: 24,050m)
   { phase: 1, type: "pause",  startSec: toSec(6, 0),   endSec: toSec(7, 54),  startR: 37211.51, endR: 37211.51, startCenter: ZONE_CENTERS[0], endCenter: ZONE_CENTERS[0], nextTargetR: 24050.0, nextTargetCenter: ZONE_CENTERS[1] },
-  { phase: 1, type: "shrink", startSec: toSec(7, 54),  endSec: toSec(9, 49),  startR: 37211.51, endR: 24050.0,  startCenter: ZONE_CENTERS[0], endCenter: ZONE_CENTERS[1], nextTargetR: null, nextTargetCenter: null },
+  { phase: 1, type: "shrink", startSec: toSec(7, 54),  endSec: toSec(9, 49),  startR: 37211.51, endR: 24050.0,  startCenter: ZONE_CENTERS[0], endCenter: ZONE_CENTERS[1], nextTargetR: 24050.0, nextTargetCenter: ZONE_CENTERS[1] },
 
   // Phase 2 (24,050m -> 13,880m)
   { phase: 2, type: "pause",  startSec: toSec(9, 49),  endSec: toSec(11, 5),  startR: 24050.0,  endR: 24050.0,  startCenter: ZONE_CENTERS[1], endCenter: ZONE_CENTERS[1], nextTargetR: 13880.0, nextTargetCenter: ZONE_CENTERS[2] },
-  { phase: 2, type: "shrink", startSec: toSec(11, 5),  endSec: toSec(11, 55), startR: 24050.0,  endR: 13880.0,  startCenter: ZONE_CENTERS[1], endCenter: ZONE_CENTERS[2], nextTargetR: null, nextTargetCenter: null },
+  { phase: 2, type: "shrink", startSec: toSec(11, 5),  endSec: toSec(11, 55), startR: 24050.0,  endR: 13880.0,  startCenter: ZONE_CENTERS[1], endCenter: ZONE_CENTERS[2], nextTargetR: 13880.0, nextTargetCenter: ZONE_CENTERS[2] },
 
   // Phase 3 (13,880m -> 7,400m)
   { phase: 3, type: "pause",  startSec: toSec(11, 55), endSec: toSec(12, 52), startR: 13880.0,  endR: 13880.0,  startCenter: ZONE_CENTERS[2], endCenter: ZONE_CENTERS[2], nextTargetR: 7400.0, nextTargetCenter: ZONE_CENTERS[3] },
-  { phase: 3, type: "shrink", startSec: toSec(12, 52), endSec: toSec(13, 26), startR: 13880.0,  endR: 7400.0,   startCenter: ZONE_CENTERS[2], endCenter: ZONE_CENTERS[3], nextTargetR: null, nextTargetCenter: null },
+  { phase: 3, type: "shrink", startSec: toSec(12, 52), endSec: toSec(13, 26), startR: 13880.0,  endR: 7400.0,   startCenter: ZONE_CENTERS[2], endCenter: ZONE_CENTERS[3], nextTargetR: 7400.0, nextTargetCenter: ZONE_CENTERS[3] },
 
   // Phase 4 (7,400m -> 3,700m)
   { phase: 4, type: "pause",  startSec: toSec(13, 26), endSec: toSec(14, 12), startR: 7400.0,   endR: 7400.0,   startCenter: ZONE_CENTERS[3], endCenter: ZONE_CENTERS[3], nextTargetR: 3700.0, nextTargetCenter: ZONE_CENTERS[4] },
-  { phase: 4, type: "shrink", startSec: toSec(14, 12), endSec: toSec(14, 35), startR: 7400.0,   endR: 3700.0,   startCenter: ZONE_CENTERS[3], endCenter: ZONE_CENTERS[4], nextTargetR: null, nextTargetCenter: null },
+  { phase: 4, type: "shrink", startSec: toSec(14, 12), endSec: toSec(14, 35), startR: 7400.0,   endR: 3700.0,   startCenter: ZONE_CENTERS[3], endCenter: ZONE_CENTERS[4], nextTargetR: 3700.0, nextTargetCenter: ZONE_CENTERS[4] },
 
   // Phase 5 (3,700m -> 1,850m)
   { phase: 5, type: "pause",  startSec: toSec(14, 35), endSec: toSec(15, 21), startR: 3700.0,   endR: 3700.0,   startCenter: ZONE_CENTERS[4], endCenter: ZONE_CENTERS[4], nextTargetR: 1850.0, nextTargetCenter: ZONE_CENTERS[5] },
-  { phase: 5, type: "shrink", startSec: toSec(15, 21), endSec: toSec(15, 36), startR: 3700.0,   endR: 1850.0,   startCenter: ZONE_CENTERS[4], endCenter: ZONE_CENTERS[5], nextTargetR: null, nextTargetCenter: null },
+  { phase: 5, type: "shrink", startSec: toSec(15, 21), endSec: toSec(15, 36), startR: 3700.0,   endR: 1850.0,   startCenter: ZONE_CENTERS[4], endCenter: ZONE_CENTERS[5], nextTargetR: 1850.0, nextTargetCenter: ZONE_CENTERS[5] },
 
   // Phase 6 (1,850m -> 925m)
   { phase: 6, type: "pause",  startSec: toSec(15, 36), endSec: toSec(16, 10), startR: 1850.0,   endR: 1850.0,   startCenter: ZONE_CENTERS[5], endCenter: ZONE_CENTERS[5], nextTargetR: 925.0, nextTargetCenter: ZONE_CENTERS[6] },
-  { phase: 6, type: "shrink", startSec: toSec(16, 10), endSec: toSec(16, 22), startR: 1850.0,   endR: 925.0,    startCenter: ZONE_CENTERS[5], endCenter: ZONE_CENTERS[6], nextTargetR: null, nextTargetCenter: null },
+  { phase: 6, type: "shrink", startSec: toSec(16, 10), endSec: toSec(16, 22), startR: 1850.0,   endR: 925.0,    startCenter: ZONE_CENTERS[5], endCenter: ZONE_CENTERS[6], nextTargetR: 925.0, nextTargetCenter: ZONE_CENTERS[6] },
 
   // Phase 7 (925m -> 463m)
   { phase: 7, type: "pause",  startSec: toSec(16, 22), endSec: toSec(16, 56), startR: 925.0,    endR: 925.0,    startCenter: ZONE_CENTERS[6], endCenter: ZONE_CENTERS[6], nextTargetR: 463.0, nextTargetCenter: ZONE_CENTERS[7] },
-  { phase: 7, type: "shrink", startSec: toSec(16, 56), endSec: toSec(17, 7),  startR: 925.0,    endR: 463.0,    startCenter: ZONE_CENTERS[6], endCenter: ZONE_CENTERS[7], nextTargetR: null, nextTargetCenter: null },
+  { phase: 7, type: "shrink", startSec: toSec(16, 56), endSec: toSec(17, 7),  startR: 925.0,    endR: 463.0,    startCenter: ZONE_CENTERS[6], endCenter: ZONE_CENTERS[7], nextTargetR: 463.0, nextTargetCenter: ZONE_CENTERS[7] },
 
   // Phase 8 (463m -> 185m)
   { phase: 8, type: "pause",  startSec: toSec(17, 7),  endSec: toSec(17, 30), startR: 463.0,    endR: 463.0,    startCenter: ZONE_CENTERS[7], endCenter: ZONE_CENTERS[7], nextTargetR: 185.0, nextTargetCenter: ZONE_CENTERS[8] },
-  { phase: 8, type: "shrink", startSec: toSec(17, 30), endSec: toSec(17, 42), startR: 463.0,    endR: 185.0,    startCenter: ZONE_CENTERS[7], endCenter: ZONE_CENTERS[8], nextTargetR: null, nextTargetCenter: null },
+  { phase: 8, type: "shrink", startSec: toSec(17, 30), endSec: toSec(17, 42), startR: 463.0,    endR: 185.0,    startCenter: ZONE_CENTERS[7], endCenter: ZONE_CENTERS[8], nextTargetR: 185.0, nextTargetCenter: ZONE_CENTERS[8] },
 
   // Phase 9 (185m -> 0m)
   { phase: 9, type: "pause",  startSec: toSec(17, 42), endSec: toSec(17, 47), startR: 185.0,    endR: 185.0,    startCenter: ZONE_CENTERS[8], endCenter: ZONE_CENTERS[8], nextTargetR: 0.0, nextTargetCenter: ZONE_CENTERS[9] },
-  { phase: 9, type: "shrink", startSec: toSec(17, 47), endSec: toSec(18, 0),  startR: 185.0,    endR: 0.0,      startCenter: ZONE_CENTERS[8], endCenter: ZONE_CENTERS[9], nextTargetR: null, nextTargetCenter: null },
+  { phase: 9, type: "shrink", startSec: toSec(17, 47), endSec: toSec(18, 0),  startR: 185.0,    endR: 0.0,      startCenter: ZONE_CENTERS[8], endCenter: ZONE_CENTERS[9], nextTargetR: 0.0, nextTargetCenter: ZONE_CENTERS[9] },
 ];
 
 function getZoneState(gameSec) {
@@ -102,6 +103,7 @@ function getZoneState(gameSec) {
     radius: Math.max(0, currentRadius),
     center: [currentCenterLat, currentCenterLon],
     remainingSec,
+    targetEndSec: stage.endSec,
     nextTargetR: stage.nextTargetR,
     nextTargetCenter: stage.nextTargetCenter,
     // Original circle prior to shrinking
@@ -237,8 +239,7 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
 function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 128) {
   if (radiusMeters <= 0) return [];
   const coords = [];
-  const km = radiusMeters / 1000.0;
-  const dRad = km / 6371.0;
+  const dRad = radiusMeters / 6371000.0;
   const cLat = (centerLat * Math.PI) / 180.0;
   const cLon = (centerLon * Math.PI) / 180.0;
 
@@ -304,7 +305,7 @@ function createBorderShrinkLayer(teamColorRef, zoneStateRef) {
           float stripeAlpha = smoothstep(-0.2, 0.2, pattern);
 
           float edgeDist = d - u_circle_radius_px;
-          float edgeGaze = clamp(edgeDist / 20.0, 0.0, 1.0);
+          float edgeGaze = 1.0;
 
           vec3 darkBase = vec3(0.04, 0.04, 0.06);
           vec3 finalColor = mix(darkBase, u_color, stripeAlpha * 0.65 + 0.15);
@@ -376,10 +377,10 @@ function createBorderShrinkLayer(teamColorRef, zoneStateRef) {
       const pt = map.project([center[1], center[0]]);
       gl.uniform2f(this.uCenter, pt.x * dpr, pt.y * dpr);
 
-      const zoom = map.getZoom();
-      const latRad = center[0] * (Math.PI / 180);
-      const metersPerPx = (40075016.686 * Math.cos(latRad)) / (512 * Math.pow(2, zoom));
-      const pxRadius = (radius / metersPerPx) * dpr;
+      // Project edge directly to eliminate discrepancy between shader storm and shrinking boundary
+      const edgeCoord = offsetLatLon(center[0], center[1], 0, radius);
+      const ptEdge = map.project([edgeCoord[1], edgeCoord[0]]);
+      const pxRadius = Math.hypot((ptEdge.x - pt.x) * dpr, (ptEdge.y - pt.y) * dpr);
       gl.uniform1f(this.uRadius, Math.max(0, pxRadius));
 
       gl.uniform1f(this.uTime, performance.now() / 1000.0);
@@ -537,7 +538,7 @@ function createFogLayer(dotsRef, unitsPlacedRef) {
 export default function App() {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
-  const isMapReadyRef = useRef(false);
+  const isMapReadyStateRef = useRef(false);
   const unitsPlacedRef = useRef(false);
   const markersRef = useRef(new Map());
   const destMarkersRef = useRef(new Map());
@@ -644,7 +645,7 @@ export default function App() {
 
   const syncMapGraphics = () => {
     const map = mapRef.current;
-    if (!map || !isMapReadyRef.current) return;
+    if (!map || !isMapReadyStateRef.current) return;
 
     const zone = zoneStateRef.current;
 
@@ -700,10 +701,10 @@ export default function App() {
       }
     }
 
-    // 3. Sync Glowing Dashed Next Zone Circle (Preview during pause phases)
+    // 3. Sync Glowing Dashed Next Zone Circle (Always visible, changes position only when shrinking ends)
     const nextZoneSource = map.getSource("next-zone-circle-source");
     if (nextZoneSource) {
-      if (zone && !zone.isShrinking && zone.nextTargetR !== null && zone.nextTargetR > 0 && zone.nextTargetCenter) {
+      if (zone && zone.nextTargetR !== null && zone.nextTargetR > 0 && zone.nextTargetCenter) {
         const nextCircleCoords = createCircleGeoJSON(
           zone.nextTargetCenter[0],
           zone.nextTargetCenter[1],
@@ -839,7 +840,7 @@ export default function App() {
   const setupLayers = (map) => {
     if (!map) return;
     const teamColor = ourTeamColorRef.current;
-    const ringColor = ourTeamColor;
+    const ringColor = teamColor;
     const nextZoneColor = isSatelliteRef.current ? "#FFEA00" : "#111111";
 
     if (!map.getSource("satellite-tiles")) {
@@ -857,7 +858,7 @@ export default function App() {
         type: "raster",
         source: "satellite-tiles",
         minzoom: 9,
-        maxzoom: 22,
+        maxzoom: 19,
         layout: {
           visibility: isSatelliteRef.current ? "visible" : "none",
         },
@@ -869,7 +870,7 @@ export default function App() {
       map.addLayer(createBorderShrinkLayer(ourTeamColorRef, zoneStateRef));
     }
 
-    // 2. Static Glowing Circle of Original Non-Shrunken Boundary (Active only during shrink)
+    // 2. Static Glowing Circle of Original Non-Shrunken Boundary (Has the SAME weight as shrinking circle)
     if (!map.getSource("shrink-origin-circle-source")) {
       map.addSource("shrink-origin-circle-source", {
         type: "geojson",
@@ -882,9 +883,23 @@ export default function App() {
         source: "shrink-origin-circle-source",
         paint: {
           "line-color": ringColor,
-          "line-width": 14,
-          "line-blur": 8,
-          "line-opacity": 0.35,
+          "line-width": 18,
+          "line-blur": 10,
+          "line-opacity": 0.45,
+          "line-dasharray": [3, 2],
+        },
+      });
+
+      map.addLayer({
+        id: "shrink-origin-circle-mid",
+        type: "line",
+        source: "shrink-origin-circle-source",
+        paint: {
+          "line-color": ringColor,
+          "line-width": 7,
+          "line-blur": 3,
+          "line-opacity": 0.75,
+          "line-dasharray": [3, 2],
         },
       });
 
@@ -894,8 +909,9 @@ export default function App() {
         source: "shrink-origin-circle-source",
         paint: {
           "line-color": ringColor,
-          "line-width": 2.0,
-          "line-opacity": 0.85,
+          "line-width": 2.5,
+          "line-opacity": 1.0,
+          "line-dasharray": [3, 2],
         },
       });
     }
@@ -943,7 +959,7 @@ export default function App() {
       });
     }
 
-    // 4. Glowing Dashed Next Zone Circle (Preview during pause phases)
+    // 4. Glowing Dashed Next Zone Circle (Preview circle always shown until shrinking ends)
     if (!map.getSource("next-zone-circle-source")) {
       map.addSource("next-zone-circle-source", {
         type: "geojson",
@@ -1145,7 +1161,7 @@ export default function App() {
     });
 
     map.on("load", () => {
-      isMapReadyRef.current = true;
+      isMapReadyStateRef.current = true;
       setupLayers(map);
 
       map.fitBounds(initialBounds, { padding: 0, duration: 0 });
@@ -1269,7 +1285,7 @@ export default function App() {
       destMarkersRef.current.clear();
       map.remove();
       mapRef.current = null;
-      isMapReadyRef.current = false;
+      isMapReadyStateRef.current = false;
       unitsPlacedRef.current = false;
     };
   }, []);
@@ -1468,7 +1484,7 @@ export default function App() {
     const newGlowColor = ourTeamColor;
     [
       "glowing-circle-outer", "glowing-circle-mid", "glowing-circle-core",
-      "shrink-origin-circle-outer", "shrink-origin-circle-core"
+      "shrink-origin-circle-outer", "shrink-origin-circle-mid", "shrink-origin-circle-core"
     ].forEach((layerId) => {
       if (map.getLayer(layerId)) {
         map.setPaintProperty(layerId, "line-color", newGlowColor);
@@ -1697,11 +1713,12 @@ export default function App() {
 
   const zoneSymbol = zoneUI.isShrinking ? "⏩" : "⏸️";
   const nextZoneSymbol = zoneUI.isShrinking ? "⏸️" : "⏩";
-  const diameterText = formatRadiusDisplay(currentRadius*2);
+  const diameterText = formatRadiusDisplay(currentRadius * 2);
   const timeUntilText = formatDurationRounded(zoneUI.remainingSec);
+  const endTimeText = formatEtaRounded(zoneUI.targetEndSec);
 
-  // Status format: "Z{X} {s} ({r}, {time} until {ns})"
-  const zoneStatusText = `Z${zoneUI.phase} ${zoneSymbol} (${diameterText}, ${timeUntilText} until ${nextZoneSymbol})`;
+  // Status format: "Z1 ⏩ (48.1km, 1h-55m until ⏸️ at HH:MM)"
+  const zoneStatusText = `Z${zoneUI.phase} ${zoneSymbol} (${diameterText}, ${timeUntilText} until ${nextZoneSymbol} at ${endTimeText})`;
 
   return (
     <div
@@ -1737,7 +1754,7 @@ export default function App() {
         }}
       />
 
-      {/* Top Center: Game Time (Transparent, White font with black outline) and Black-Outlined Progress Bar */}
+      {/* Top Center: Game Time and Black-Outlined Progress Bar */}
       <div
         style={{
           position: "absolute",
@@ -1750,7 +1767,7 @@ export default function App() {
           alignItems: "center",
           fontFamily: "system-ui, -apple-system, sans-serif",
           userSelect: "none",
-          minWidth: "220px",
+          minWidth: "260px",
           background: "transparent",
         }}
       >
