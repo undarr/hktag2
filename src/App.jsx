@@ -6,8 +6,8 @@ import { initGraph, snap, pathfind } from "./fetch";
 // --- GLOWING CIRCLE & DYNAMIC BOUNDARY CONFIG ---
 const CIRCLE_CENTER_LAT = 22.3749714;
 const CIRCLE_CENTER_LON = 114.1391081;
-const CIRCLE_RADIUS_METERS = 36711.51;
-const BOUNDARY_MARGIN_METERS = 2500.0;
+const CIRCLE_RADIUS_METERS = 37211.51;
+const BOUNDARY_MARGIN_METERS = 2000.0;
 const BASE_SPAN_METERS = CIRCLE_RADIUS_METERS + BOUNDARY_MARGIN_METERS; // 39,211.51m
 
 function calculateDynamicBounds(width, height) {
@@ -492,7 +492,47 @@ export default function App() {
       });
     }
 
-    // 2. Glowing Boundary Circle Layers
+    // 2. Darkening Mask Outside the Circle (Inverted Polygon)
+    if (!map.getSource("outside-darkening-source")) {
+      const circleHole = createCircleGeoJSON(
+        CIRCLE_CENTER_LAT,
+        CIRCLE_CENTER_LON,
+        CIRCLE_RADIUS_METERS,
+        128
+      );
+
+      // World boundary envelope with the circle as an interior hole
+      const worldOuterBox = [
+        [-180, -85.051129],
+        [180, -85.051129],
+        [180, 85.051129],
+        [-180, 85.051129],
+        [-180, -85.051129],
+      ];
+
+      map.addSource("outside-darkening-source", {
+        type: "geojson",
+        data: {
+          type: "Feature",
+          geometry: {
+            type: "Polygon",
+            coordinates: [worldOuterBox, circleHole],
+          },
+        },
+      });
+
+      map.addLayer({
+        id: "outside-darkening-layer",
+        type: "fill",
+        source: "outside-darkening-source",
+        paint: {
+          "fill-color": ourTeamColor,
+          "fill-opacity": 0.7, // Adjusts outer darkness intensity
+        },
+      });
+    }
+
+    // 3. Glowing Circle Perimeter Layers
     if (!map.getSource("glowing-circle-source")) {
       const circlePolyCoords = createCircleGeoJSON(
         CIRCLE_CENTER_LAT,
@@ -556,7 +596,7 @@ export default function App() {
       });
     }
 
-    // 3. Opponent Units
+    // 4. Opponent Units
     if (!map.getSource("opponent-units")) {
       map.addSource("opponent-units", {
         type: "geojson",
@@ -586,7 +626,7 @@ export default function App() {
       });
     }
 
-    // 4. Paths & Vision Rings
+    // 5. Paths & Vision Rings
     if (!map.getSource("unit-paths")) {
       map.addSource("unit-paths", {
         type: "geojson",
@@ -675,7 +715,7 @@ export default function App() {
       });
     }
 
-    // 5. Fog-of-War Shader Layer
+    // 6. Fog-of-War Shader Layer
     if (!map.getLayer("fog-of-war-layer")) {
       map.addLayer(createFogLayer(dotsRef, unitsPlacedRef));
     }
@@ -729,7 +769,7 @@ export default function App() {
       isMapReadyRef.current = true;
       setupLayers(map);
 
-      // Fit map so circle and 2500m margin fill the viewport precisely
+      // Fit map so circle and margin fill viewport precisely
       map.fitBounds(initialBounds, { padding: 0, duration: 0 });
 
       dotsRef.current.forEach((dot) => {
