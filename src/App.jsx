@@ -2,538 +2,31 @@ import React, { useEffect, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { initGraph, snap, pathfind } from "./fetch";
-
-// --- GLOWING CIRCLE & DYNAMIC BOUNDARY CONFIG ---
-const INITIAL_CIRCLE_CENTER_LAT = 22.3749714;
-const INITIAL_CIRCLE_CENTER_LON = 114.1391081;
-const INITIAL_CIRCLE_RADIUS_METERS = 37211.51;
-const BOUNDARY_MARGIN_METERS = 2000.0;
-const BASE_SPAN_METERS = INITIAL_CIRCLE_RADIUS_METERS + BOUNDARY_MARGIN_METERS;
-
-// Game Time Constants: 06:00:00 to 18:00:00 (12 hours = 43,200 seconds)
-const START_GAME_SECONDS = 6 * 3600;
-const END_GAME_SECONDS = 18 * 3600;
-const TIME_SCALE = 20; // 1s irl = 20s in-game
-
-// Helper to convert meters offset to degrees
-function offsetLatLon(lat, lon, northMeters, eastMeters) {
-  const dLat = (northMeters / 6371000.0) * (180 / Math.PI);
-  const dLon =
-    (eastMeters / (6371000.0 * Math.cos((lat * Math.PI) / 180))) *
-    (180 / Math.PI);
-  return [lat + dLat, lon + dLon];
-}
-
-// Specification: return current lat + 100m, current lon + 100m
-function getZoneCenter(currentLat, currentLon) {
-  return offsetLatLon(currentLat, currentLon, 100, 100);
-}
-
-// Pre-compute zone center targets for each shrinking stage
-const ZONE_CENTERS = (() => {
-  const centers = [[INITIAL_CIRCLE_CENTER_LAT, INITIAL_CIRCLE_CENTER_LON]];
-  for (let i = 1; i <= 9; i++) {
-    const prev = centers[i - 1];
-    centers.push(getZoneCenter(prev[0], prev[1]));
-  }
-  return centers;
-})();
-
-const toSec = (h, m) => h * 3600 + m * 60;
-
-// Timeline config (06:00 -> 18:00)
-// nextTargetR and nextTargetCenter are retained during shrink so preview circle persists until shrinking ends
-const TIMELINE = [
-  // Phase 1 (Initial R: 37,211.51m -> Target R: 24,050m)
-  { phase: 1, type: "pause",  startSec: toSec(6, 0),   endSec: toSec(7, 54),  startR: 37211.51, endR: 37211.51, startCenter: ZONE_CENTERS[0], endCenter: ZONE_CENTERS[0], nextTargetR: 24050.0, nextTargetCenter: ZONE_CENTERS[1] },
-  { phase: 1, type: "shrink", startSec: toSec(7, 54),  endSec: toSec(9, 49),  startR: 37211.51, endR: 24050.0,  startCenter: ZONE_CENTERS[0], endCenter: ZONE_CENTERS[1], nextTargetR: 24050.0, nextTargetCenter: ZONE_CENTERS[1] },
-
-  // Phase 2 (24,050m -> 13,880m)
-  { phase: 2, type: "pause",  startSec: toSec(9, 49),  endSec: toSec(11, 5),  startR: 24050.0,  endR: 24050.0,  startCenter: ZONE_CENTERS[1], endCenter: ZONE_CENTERS[1], nextTargetR: 13880.0, nextTargetCenter: ZONE_CENTERS[2] },
-  { phase: 2, type: "shrink", startSec: toSec(11, 5),  endSec: toSec(11, 55), startR: 24050.0,  endR: 13880.0,  startCenter: ZONE_CENTERS[1], endCenter: ZONE_CENTERS[2], nextTargetR: 13880.0, nextTargetCenter: ZONE_CENTERS[2] },
-
-  // Phase 3 (13,880m -> 7,400m)
-  { phase: 3, type: "pause",  startSec: toSec(11, 55), endSec: toSec(12, 52), startR: 13880.0,  endR: 13880.0,  startCenter: ZONE_CENTERS[2], endCenter: ZONE_CENTERS[2], nextTargetR: 7400.0, nextTargetCenter: ZONE_CENTERS[3] },
-  { phase: 3, type: "shrink", startSec: toSec(12, 52), endSec: toSec(13, 26), startR: 13880.0,  endR: 7400.0,   startCenter: ZONE_CENTERS[2], endCenter: ZONE_CENTERS[3], nextTargetR: 7400.0, nextTargetCenter: ZONE_CENTERS[3] },
-
-  // Phase 4 (7,400m -> 3,700m)
-  { phase: 4, type: "pause",  startSec: toSec(13, 26), endSec: toSec(14, 12), startR: 7400.0,   endR: 7400.0,   startCenter: ZONE_CENTERS[3], endCenter: ZONE_CENTERS[3], nextTargetR: 3700.0, nextTargetCenter: ZONE_CENTERS[4] },
-  { phase: 4, type: "shrink", startSec: toSec(14, 12), endSec: toSec(14, 35), startR: 7400.0,   endR: 3700.0,   startCenter: ZONE_CENTERS[3], endCenter: ZONE_CENTERS[4], nextTargetR: 3700.0, nextTargetCenter: ZONE_CENTERS[4] },
-
-  // Phase 5 (3,700m -> 1,850m)
-  { phase: 5, type: "pause",  startSec: toSec(14, 35), endSec: toSec(15, 21), startR: 3700.0,   endR: 3700.0,   startCenter: ZONE_CENTERS[4], endCenter: ZONE_CENTERS[4], nextTargetR: 1850.0, nextTargetCenter: ZONE_CENTERS[5] },
-  { phase: 5, type: "shrink", startSec: toSec(15, 21), endSec: toSec(15, 36), startR: 3700.0,   endR: 1850.0,   startCenter: ZONE_CENTERS[4], endCenter: ZONE_CENTERS[5], nextTargetR: 1850.0, nextTargetCenter: ZONE_CENTERS[5] },
-
-  // Phase 6 (1,850m -> 925m)
-  { phase: 6, type: "pause",  startSec: toSec(15, 36), endSec: toSec(16, 10), startR: 1850.0,   endR: 1850.0,   startCenter: ZONE_CENTERS[5], endCenter: ZONE_CENTERS[5], nextTargetR: 925.0, nextTargetCenter: ZONE_CENTERS[6] },
-  { phase: 6, type: "shrink", startSec: toSec(16, 10), endSec: toSec(16, 22), startR: 1850.0,   endR: 925.0,    startCenter: ZONE_CENTERS[5], endCenter: ZONE_CENTERS[6], nextTargetR: 925.0, nextTargetCenter: ZONE_CENTERS[6] },
-
-  // Phase 7 (925m -> 463m)
-  { phase: 7, type: "pause",  startSec: toSec(16, 22), endSec: toSec(16, 56), startR: 925.0,    endR: 925.0,    startCenter: ZONE_CENTERS[6], endCenter: ZONE_CENTERS[6], nextTargetR: 463.0, nextTargetCenter: ZONE_CENTERS[7] },
-  { phase: 7, type: "shrink", startSec: toSec(16, 56), endSec: toSec(17, 7),  startR: 925.0,    endR: 463.0,    startCenter: ZONE_CENTERS[6], endCenter: ZONE_CENTERS[7], nextTargetR: 463.0, nextTargetCenter: ZONE_CENTERS[7] },
-
-  // Phase 8 (463m -> 185m)
-  { phase: 8, type: "pause",  startSec: toSec(17, 7),  endSec: toSec(17, 30), startR: 463.0,    endR: 463.0,    startCenter: ZONE_CENTERS[7], endCenter: ZONE_CENTERS[7], nextTargetR: 185.0, nextTargetCenter: ZONE_CENTERS[8] },
-  { phase: 8, type: "shrink", startSec: toSec(17, 30), endSec: toSec(17, 42), startR: 463.0,    endR: 185.0,    startCenter: ZONE_CENTERS[7], endCenter: ZONE_CENTERS[8], nextTargetR: 185.0, nextTargetCenter: ZONE_CENTERS[8] },
-
-  // Phase 9 (185m -> 0m)
-  { phase: 9, type: "pause",  startSec: toSec(17, 42), endSec: toSec(17, 47), startR: 185.0,    endR: 185.0,    startCenter: ZONE_CENTERS[8], endCenter: ZONE_CENTERS[8], nextTargetR: 0.0, nextTargetCenter: ZONE_CENTERS[9] },
-  { phase: 9, type: "shrink", startSec: toSec(17, 47), endSec: toSec(18, 0),  startR: 185.0,    endR: 0.0,      startCenter: ZONE_CENTERS[8], endCenter: ZONE_CENTERS[9], nextTargetR: 0.0, nextTargetCenter: ZONE_CENTERS[9] },
-];
-
-function getZoneState(gameSec) {
-  const s = Math.min(Math.max(gameSec, START_GAME_SECONDS), END_GAME_SECONDS);
-  let stage = TIMELINE.find((st) => s >= st.startSec && s < st.endSec);
-  if (!stage) stage = TIMELINE[TIMELINE.length - 1];
-
-  const duration = stage.endSec - stage.startSec;
-  const progress = duration > 0 ? (s - stage.startSec) / duration : 1.0;
-
-  const currentRadius = stage.startR + (stage.endR - stage.startR) * progress;
-  const currentCenterLat =
-    stage.startCenter[0] + (stage.endCenter[0] - stage.startCenter[0]) * progress;
-  const currentCenterLon =
-    stage.startCenter[1] + (stage.endCenter[1] - stage.startCenter[1]) * progress;
-
-  const remainingSec = Math.max(0, stage.endSec - s);
-
-  return {
-    phase: stage.phase,
-    isShrinking: stage.type === "shrink",
-    radius: Math.max(0, currentRadius),
-    center: [currentCenterLat, currentCenterLon],
-    remainingSec,
-    targetEndSec: stage.endSec,
-    nextTargetR: stage.nextTargetR,
-    nextTargetCenter: stage.nextTargetCenter,
-    // Original circle prior to shrinking
-    originRadius: stage.startR,
-    originCenter: stage.startCenter,
-  };
-}
-
-function calculateDynamicBounds(width, height) {
-  const w = width || window.innerWidth || 1;
-  const h = height || window.innerHeight || 1;
-
-  let spanNorthSouthMeters;
-  let spanEastWestMeters;
-
-  if (w > h) {
-    spanNorthSouthMeters = BASE_SPAN_METERS;
-    spanEastWestMeters = BASE_SPAN_METERS * (w / h);
-  } else {
-    spanEastWestMeters = BASE_SPAN_METERS;
-    spanNorthSouthMeters = BASE_SPAN_METERS * (h / w);
-  }
-
-  const dLat = (spanNorthSouthMeters / 6371000.0) * (180 / Math.PI);
-  const dLon =
-    (spanEastWestMeters /
-      (6371000.0 * Math.cos((INITIAL_CIRCLE_CENTER_LAT * Math.PI) / 180))) *
-    (180 / Math.PI);
-
-  return [
-    [INITIAL_CIRCLE_CENTER_LON - dLon, INITIAL_CIRCLE_CENTER_LAT - dLat],
-    [INITIAL_CIRCLE_CENTER_LON + dLon, INITIAL_CIRCLE_CENTER_LAT + dLat],
-  ];
-}
-
-const SATELLITE_STYLE = {
-  version: 8,
-  sources: {
-    "satellite-tiles": {
-      type: "raster",
-      tiles: [
-        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-      ],
-      tileSize: 256,
-      maxzoom: 19,
-    },
-  },
-  layers: [
-    {
-      id: "satellite-layer",
-      type: "raster",
-      source: "satellite-tiles",
-      minzoom: 9,
-      maxzoom: 22,
-    },
-  ],
-};
-
-const MAP_STYLE = "https://tiles.openfreemap.org/styles/liberty";
-
-const TEAM_COLORS = [
-  "#D50000", "#FF5500", "#C87800", "#008828",
-  "#5EA800", "#0088D6", "#002BFF", "#5500FF",
-  "#FF1464", "#7B3800", "#66002A", "#003866",
-];
-
-const DOT_CONFIGS = [
-  { id: 0, symbol: "👮", name: "Officer" },
-  { id: 1, symbol: "🚔", name: "Cruiser" },
-  { id: 2, symbol: "🚁", name: "Chopper" },
-  { id: 3, symbol: "🏃", name: "Runner" },
-];
-
-const STATE_COLORS = {
-  Move: "#2e7d32",
-  Ferry: "#0288d1",
-  Redirecting: "#ed6c02",
-  Stop: "#757575",
-};
-
-function hexToRgb(hex) {
-  const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-  return result
-    ? [
-        parseInt(result[1], 16) / 255,
-        parseInt(result[2], 16) / 255,
-        parseInt(result[3], 16) / 255,
-      ]
-    : [1, 0, 0];
-}
-
-function formatGameClock(totalSeconds) {
-  const s = Math.min(Math.max(totalSeconds, START_GAME_SECONDS), END_GAME_SECONDS);
-  const hours = Math.floor(s / 3600);
-  const mins = Math.floor((s % 3600) / 60);
-  const secs = Math.floor(s % 60);
-  return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-}
-
-function formatEtaRounded(totalSeconds) {
-  const s = Math.min(Math.max(totalSeconds, START_GAME_SECONDS), END_GAME_SECONDS);
-  const roundedSec = Math.round(s / 60) * 60;
-  const hours = Math.floor(roundedSec / 3600) % 24;
-  const mins = Math.floor((roundedSec % 3600) / 60);
-  return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
-}
-
-function formatDurationRounded(sec) {
-  const totalMins = Math.round(sec / 60);
-  const hours = Math.floor(totalMins / 60);
-  const mins = totalMins % 60;
-  return `${hours}h-${mins}m`;
-}
-
-function formatRadiusDisplay(r) {
-  if (r >= 1000) {
-    return `${(r / 1000).toFixed(1)}km`;
-  }
-  return `${Math.round(r)}m`;
-}
-
-function haversineMeters(lat1, lon1, lat2, lon2) {
-  const R = 6371000.0;
-  const dLat = (lat2 - lat1) * (Math.PI / 180);
-  const dLon = (lon2 - lon1) * (Math.PI / 180);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
-    Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function createCircleGeoJSON(centerLat, centerLon, radiusMeters, points = 128) {
-  if (radiusMeters <= 0) return [];
-  const coords = [];
-  const dRad = radiusMeters / 6371000.0;
-  const cLat = (centerLat * Math.PI) / 180.0;
-  const cLon = (centerLon * Math.PI) / 180.0;
-
-  for (let i = 0; i <= points; i++) {
-    const bearing = (i * 2 * Math.PI) / points;
-    const lat = Math.asin(
-      Math.sin(cLat) * Math.cos(dRad) +
-        Math.cos(cLat) * Math.sin(dRad) * Math.cos(bearing)
-    );
-    const lon =
-      cLon +
-      Math.atan2(
-        Math.sin(bearing) * Math.sin(dRad) * Math.cos(cLat),
-        Math.cos(dRad) - Math.sin(cLat) * Math.sin(lat)
-      );
-    coords.push([(lon * 180.0) / Math.PI, (lat * 180.0) / Math.PI]);
-  }
-  return coords;
-}
-
-// Custom WebGL Layer for animated/static horizontal warning stripes
-function createBorderShrinkLayer(teamColorRef, zoneStateRef) {
-  return {
-    id: "border-shrink-layer",
-    type: "custom",
-    renderingMode: "2d",
-
-    onAdd(map, gl) {
-      this.map = map;
-      this.gl = gl;
-
-      const vertexSource = `
-        attribute vec2 a_pos;
-        void main() {
-          gl_Position = vec4(a_pos, 0.0, 1.0);
-        }
-      `;
-
-      const fragmentSource = `
-        precision highp float;
-        uniform vec2 u_resolution;
-        uniform vec2 u_circle_center;
-        uniform float u_circle_radius_px;
-        uniform float u_time;
-        uniform vec3 u_color;
-        uniform float u_is_shrinking;
-
-        void main() {
-          vec2 fragCoord = gl_FragCoord.xy;
-          fragCoord.y = u_resolution.y - fragCoord.y;
-
-          float d = distance(fragCoord, u_circle_center);
-
-          if (d <= u_circle_radius_px) {
-            discard;
-          }
-
-          float stripeWidth = 40.0;
-          float speed = 75.0;
-          float movingX = fragCoord.x - (u_time * speed * u_is_shrinking);
-
-          float pattern = sin((movingX + fragCoord.y * 0.35) * (3.14159265 / stripeWidth));
-          float stripeAlpha = smoothstep(-0.2, 0.2, pattern);
-
-          float edgeDist = d - u_circle_radius_px;
-          float edgeGaze = 1.0;
-
-          vec3 darkBase = vec3(0.04, 0.04, 0.06);
-          vec3 finalColor = mix(darkBase, u_color, stripeAlpha * 0.65 + 0.15);
-          float alpha = (0.50 + stripeAlpha * 0.28) * edgeGaze;
-
-          gl_FragColor = vec4(finalColor, alpha);
-        }
-      `;
-
-      const createShader = (type, src) => {
-        const shader = gl.createShader(type);
-        gl.shaderSource(shader, src);
-        gl.compileShader(shader);
-        return shader;
-      };
-
-      const prog = gl.createProgram();
-      gl.attachShader(prog, createShader(gl.VERTEX_SHADER, vertexSource));
-      gl.attachShader(prog, createShader(gl.FRAGMENT_SHADER, fragmentSource));
-      gl.linkProgram(prog);
-      this.program = prog;
-
-      this.aPos = gl.getAttribLocation(prog, "a_pos");
-      this.uRes = gl.getUniformLocation(prog, "u_resolution");
-      this.uCenter = gl.getUniformLocation(prog, "u_circle_center");
-      this.uRadius = gl.getUniformLocation(prog, "u_circle_radius_px");
-      this.uTime = gl.getUniformLocation(prog, "u_time");
-      this.uColor = gl.getUniformLocation(prog, "u_color");
-      this.uIsShrinking = gl.getUniformLocation(prog, "u_is_shrinking");
-
-      this.vertexBuffer = gl.createBuffer();
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
-      gl.bufferData(
-        gl.ARRAY_BUFFER,
-        new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
-        gl.STATIC_DRAW
-      );
-    },
-
-    onRemove(map, gl) {
-      if (this.program) {
-        gl.deleteProgram(this.program);
-        this.program = null;
-      }
-      if (this.vertexBuffer) {
-        gl.deleteBuffer(this.vertexBuffer);
-        this.vertexBuffer = null;
-      }
-    },
-
-    render(gl) {
-      gl.useProgram(this.program);
-      gl.enable(gl.BLEND);
-      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-      const map = this.map;
-      const canvas = map.getCanvas();
-      const dpr = window.devicePixelRatio || 1;
-      const width = canvas.width;
-      const height = canvas.height;
-
-      gl.uniform2f(this.uRes, width, height);
-
-      const zone = zoneStateRef.current;
-      const center = zone ? zone.center : [INITIAL_CIRCLE_CENTER_LAT, INITIAL_CIRCLE_CENTER_LON];
-      const radius = zone ? zone.radius : INITIAL_CIRCLE_RADIUS_METERS;
-      const isShrinking = zone && zone.isShrinking ? 1.0 : 0.0;
-
-      const pt = map.project([center[1], center[0]]);
-      gl.uniform2f(this.uCenter, pt.x * dpr, pt.y * dpr);
-
-      // Project edge directly to eliminate discrepancy between shader storm and shrinking boundary
-      const edgeCoord = offsetLatLon(center[0], center[1], 0, radius);
-      const ptEdge = map.project([edgeCoord[1], edgeCoord[0]]);
-      const pxRadius = Math.hypot((ptEdge.x - pt.x) * dpr, (ptEdge.y - pt.y) * dpr);
-      gl.uniform1f(this.uRadius, Math.max(0, pxRadius));
-
-      gl.uniform1f(this.uTime, performance.now() / 1000.0);
-      gl.uniform1f(this.uIsShrinking, isShrinking);
-
-      const rgb = hexToRgb(teamColorRef.current);
-      gl.uniform3f(this.uColor, rgb[0], rgb[1], rgb[2]);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
-      gl.enableVertexAttribArray(this.aPos);
-      gl.vertexAttribPointer(this.aPos, 2, gl.FLOAT, false, 0, 0);
-
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
-    },
-  };
-}
-
-// Custom WebGL Fog-of-War Layer
-function createFogLayer(dotsRef, unitsPlacedRef) {
-  return {
-    id: "fog-of-war-layer",
-    type: "custom",
-    renderingMode: "2d",
-
-    onAdd(map, gl) {
-      this.map = map;
-      this.gl = gl;
-
-      const vertexSource = `
-        attribute vec2 a_pos;
-        void main() {
-          gl_Position = vec4(a_pos, 0.0, 1.0);
-        }
-      `;
-
-      const fragmentSource = `
-        precision highp float;
-        uniform vec2 u_resolution;
-        uniform vec2 u_centers[4];
-        uniform float u_radii[4];
-        uniform int u_unit_count;
-
-        void main() {
-          vec2 fragCoord = gl_FragCoord.xy;
-          fragCoord.y = u_resolution.y - fragCoord.y;
-
-          float fogFactor = 1.0;
-
-          for (int i = 0; i < 4; i++) {
-            if (i >= u_unit_count) break;
-            float d = distance(fragCoord, u_centers[i]);
-            float rInner = u_radii[i] * (400.0 / 600.0);
-            float rOuter = u_radii[i];
-
-            if (d <= rInner) {
-              discard;
-            }
-            if (d < rOuter) {
-              float vis = 1.0 - smoothstep(rInner, rOuter, d);
-              fogFactor *= (1.0 - vis);
-            }
-          }
-
-          float fogOpacity = 0.72 * fogFactor;
-          if (fogOpacity <= 0.002) discard;
-          gl_FragColor = vec4(0.027, 0.054, 0.090, fogOpacity);
-        }
-      `;
-
-      const createShader = (type, src) => {
-        const shader = gl.createShader(type);
-        gl.shaderSource(shader, src);
-        gl.compileShader(shader);
-        return shader;
-      };
-
-      const prog = gl.createProgram();
-      gl.attachShader(prog, createShader(gl.VERTEX_SHADER, vertexSource));
-      gl.attachShader(prog, createShader(gl.FRAGMENT_SHADER, fragmentSource));
-      gl.linkProgram(prog);
-      this.program = prog;
-
-      this.aPos = gl.getAttribLocation(prog, "a_pos");
-      this.uRes = gl.getUniformLocation(prog, "u_resolution");
-      this.uCenters = gl.getUniformLocation(prog, "u_centers[0]");
-      this.uRadii = gl.getUniformLocation(prog, "u_radii[0]");
-      this.uCount = gl.getUniformLocation(prog, "u_unit_count");
-
-      this.vertexBuffer = gl.createBuffer();
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
-      gl.bufferData(
-        gl.ARRAY_BUFFER,
-        new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
-        gl.STATIC_DRAW
-      );
-    },
-
-    onRemove(map, gl) {
-      if (this.program) {
-        gl.deleteProgram(this.program);
-        this.program = null;
-      }
-      if (this.vertexBuffer) {
-        gl.deleteBuffer(this.vertexBuffer);
-        this.vertexBuffer = null;
-      }
-    },
-
-    render(gl) {
-      gl.useProgram(this.program);
-      gl.enable(gl.BLEND);
-      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-      const map = this.map;
-      const canvas = map.getCanvas();
-      const width = canvas.width;
-      const height = canvas.height;
-
-      gl.uniform2f(this.uRes, width, height);
-
-      if (!unitsPlacedRef.current) {
-        gl.uniform1i(this.uCount, 0);
-      } else {
-        gl.uniform1i(this.uCount, dotsRef.current.length);
-
-        const centers = [];
-        const radii = [];
-        const dpr = window.devicePixelRatio || 1;
-        const zoom = map.getZoom();
-
-        dotsRef.current.forEach((dot) => {
-          const pt = map.project([dot.pos[1], dot.pos[0]]);
-          centers.push(pt.x * dpr, pt.y * dpr);
-
-          const latRad = dot.pos[0] * (Math.PI / 180);
-          const metersPerPx = (40075016.686 * Math.cos(latRad)) / (512 * Math.pow(2, zoom));
-          const sightMeters = dot.sight || 800.0;
-          const pxRadius = Math.max(3.0 * dpr, (sightMeters / metersPerPx) * dpr);
-          radii.push(pxRadius);
-        });
-
-        gl.uniform2fv(this.uCenters, new Float32Array(centers));
-        gl.uniform1fv(this.uRadii, new Float32Array(radii));
-      }
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
-      gl.enableVertexAttribArray(this.aPos);
-      gl.vertexAttribPointer(this.aPos, 2, gl.FLOAT, false, 0, 0);
-
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
-    },
-  };
-}
+import {
+  INITIAL_CIRCLE_CENTER_LAT,
+  INITIAL_CIRCLE_CENTER_LON,
+  INITIAL_CIRCLE_RADIUS_METERS,
+  START_GAME_SECONDS,
+  END_GAME_SECONDS,
+  TIME_SCALE,
+  MAP_STYLE,
+  SATELLITE_STYLE,
+  TEAM_COLORS,
+  DOT_CONFIGS,
+  STATE_COLORS,
+  getZoneState,
+  calculateDynamicBounds,
+  formatGameClock,
+  formatEtaRounded,
+  formatDurationRounded,
+  formatRadiusDisplay,
+  haversineMeters,
+  createCircleGeoJSON,
+  createBorderShrinkLayer,
+  createFogLayer,
+} from "./gameConfig";
+
+const GREY_STORM_COLOR = "#60646c";
 
 export default function App() {
   const mapContainerRef = useRef(null);
@@ -546,9 +39,31 @@ export default function App() {
 
   const selectionOrderRef = useRef(DOT_CONFIGS.map((c) => c.id));
 
-  const [ourTeamColor] = useState(() => TEAM_COLORS[Math.floor(Math.random() * TEAM_COLORS.length)]);
-  const ourTeamColorRef = useRef(ourTeamColor);
-  ourTeamColorRef.current = ourTeamColor;
+  // Game sequence: "INITIAL" | "INTRO" | "PLACE_HUNTERS" | "PLACE_RUNNER" | "FOG_FADE" | "COUNTDOWN" | "PLAYING"
+  const [gameState, setGameState] = useState("INITIAL");
+  const gameStateRef = useRef("INITIAL");
+
+  // Dynamic fog opacity reference: 0.0 initially, fades 0.0 -> 1.0 over 5s after confirming runner
+  const fogOpacityRef = useRef(0.0);
+  const fogFadeStartRef = useRef(0);
+
+  // Countdown state
+  const [countdownNumber, setCountdownNumber] = useState(10);
+  const countdownIntervalRef = useRef(null);
+
+  // Placement tracking
+  const hunterClickCountRef = useRef(0);
+  const [placedHuntersCount, setPlacedHuntersCount] = useState(0);
+  const [runnerPlaced, setRunnerPlaced] = useState(false);
+  const isSnappingRef = useRef(false);
+
+  const [selectedColor, setSelectedColor] = useState(null);
+  const [ourTeamColor, setOurTeamColor] = useState(GREY_STORM_COLOR);
+  const ourTeamColorRef = useRef(GREY_STORM_COLOR);
+
+  const [hudSlidingIn, setHudSlidingIn] = useState(false);
+  const hudSlidingInRef = useRef(false);
+  const introStartRef = useRef(0);
 
   const [isSatellite, setIsSatellite] = useState(true);
   const isSatelliteRef = useRef(true);
@@ -561,7 +76,13 @@ export default function App() {
   const [gameSeconds, setGameSeconds] = useState(START_GAME_SECONDS);
   const gameSecondsRef = useRef(START_GAME_SECONDS);
 
-  const zoneStateRef = useRef(getZoneState(START_GAME_SECONDS));
+  const zoneStateRef = useRef({
+    ...getZoneState(START_GAME_SECONDS),
+    radius: 0,
+    isShrinking: false,
+    originRadius: 0,
+    nextTargetR: null,
+  });
   const [zoneUI, setZoneUI] = useState(zoneStateRef.current);
 
   const [dotsUI, setDotsUI] = useState(
@@ -573,9 +94,9 @@ export default function App() {
       eta: "--",
       timeLeft: "--",
       distLeft: "--",
-      speed: 3.0,
+      speed: 2,
       radius: 30,
-      sight: 800,
+      sight: 200,
     }))
   );
 
@@ -585,12 +106,13 @@ export default function App() {
       name: cfg.name,
       symbol: cfg.symbol,
       pos: [22.3193, 114.1694],
+      isPlaced: false,
       state: "Stop",
       preRedirectState: null,
       redirectRequestId: 0,
-      speed: 3.0,
+      speed: 2.5,
       radius: 30,
-      sight: 800,
+      sight: 200,
       waypoints: [],
       waterFlags: [],
       segIdx: 0,
@@ -601,8 +123,27 @@ export default function App() {
     }))
   );
 
-  // Game Clock update: 0.05s irl = +1s in-game
+  // Lock and unlock zoom depending on color selection state
   useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (gameState === "INITIAL") {
+      map.scrollZoom.disable();
+      map.doubleClickZoom.disable();
+      map.touchZoomRotate.disable();
+      map.boxZoom.disable();
+    } else {
+      map.scrollZoom.enable();
+      map.doubleClickZoom.enable();
+      map.touchZoomRotate.enable();
+      map.boxZoom.enable();
+    }
+  }, [gameState]);
+
+  // Start in-game timer ONLY when entering PLAYING state
+  useEffect(() => {
+    if (gameState !== "PLAYING") return;
+
     const timer = setInterval(() => {
       if (gameSecondsRef.current >= END_GAME_SECONDS) {
         clearInterval(timer);
@@ -618,7 +159,7 @@ export default function App() {
     }, 50);
 
     return () => clearInterval(timer);
-  }, []);
+  }, [gameState]);
 
   const updateStackingOrder = () => {
     const order = selectionOrderRef.current;
@@ -648,12 +189,13 @@ export default function App() {
     if (!map || !isMapReadyStateRef.current) return;
 
     const zone = zoneStateRef.current;
+    const isPlayingOrIntro = gameStateRef.current !== "INITIAL";
 
-    // 1. Sync glowing perimeter circle (active boundary)
-    if (zone && zone.radius > 0) {
-      const circlePolyCoords = createCircleGeoJSON(zone.center[0], zone.center[1], zone.radius, 128);
-      const glowSource = map.getSource("glowing-circle-source");
-      if (glowSource) {
+    // 1. Glowing perimeter circle
+    const glowSource = map.getSource("glowing-circle-source");
+    if (glowSource) {
+      if (zone && zone.radius > 0 && isPlayingOrIntro) {
+        const circlePolyCoords = createCircleGeoJSON(zone.center[0], zone.center[1], zone.radius, 128);
         glowSource.setData({
           type: "FeatureCollection",
           features: [
@@ -666,18 +208,21 @@ export default function App() {
             },
           ],
         });
-      }
-    } else {
-      const glowSource = map.getSource("glowing-circle-source");
-      if (glowSource) {
+      } else {
         glowSource.setData({ type: "FeatureCollection", features: [] });
       }
     }
 
-    // 2. Sync Static Initial Non-Shrunken Circle (Visible ONLY when shrinking)
+    // 2. Initial Non-Shrunken Circle
     const originSource = map.getSource("shrink-origin-circle-source");
     if (originSource) {
-      if (zone && zone.isShrinking && zone.originRadius > 0 && zone.originCenter) {
+      if (
+        gameStateRef.current === "PLAYING" &&
+        zone &&
+        zone.isShrinking &&
+        zone.originRadius > 0 &&
+        zone.originCenter
+      ) {
         const originCoords = createCircleGeoJSON(
           zone.originCenter[0],
           zone.originCenter[1],
@@ -701,10 +246,16 @@ export default function App() {
       }
     }
 
-    // 3. Sync Glowing Dashed Next Zone Circle (Always visible, changes position only when shrinking ends)
+    // 3. Glowing Dashed Next Zone Circle
     const nextZoneSource = map.getSource("next-zone-circle-source");
     if (nextZoneSource) {
-      if (zone && zone.nextTargetR !== null && zone.nextTargetR > 0 && zone.nextTargetCenter) {
+      if (
+        gameStateRef.current === "PLAYING" &&
+        zone &&
+        zone.nextTargetR !== null &&
+        zone.nextTargetR > 0 &&
+        zone.nextTargetCenter
+      ) {
         const nextCircleCoords = createCircleGeoJSON(
           zone.nextTargetCenter[0],
           zone.nextTargetCenter[1],
@@ -728,16 +279,19 @@ export default function App() {
       }
     }
 
-    // 4. Unit & Dest Markers
+    // 4. Unit & Destination Markers
     dotsRef.current.forEach((dot) => {
       const marker = markersRef.current.get(dot.id);
       if (marker) {
         marker.setLngLat([dot.pos[1], dot.pos[0]]);
+        const el = marker.getElement();
+        el.style.display = dot.isPlaced ? "flex" : "none";
       }
 
       const destMarker = destMarkersRef.current.get(dot.id);
       if (destMarker) {
         const hasDest =
+          gameStateRef.current === "PLAYING" &&
           dot.state !== "Stop" &&
           dot.waypoints &&
           dot.waypoints.length > 1 &&
@@ -754,28 +308,44 @@ export default function App() {
       }
     });
 
-    // 5. Polylines and rings
+    // 5. Polylines, rings, and vision
     const lineFeatures = [];
     const ringFeatures = [];
     const visionFeatures = [];
 
-    dotsRef.current.forEach((dot) => {
-      const { waypoints, waterFlags, segIdx, pos, radius } = dot;
+    if (gameStateRef.current === "PLAYING") {
+      dotsRef.current.forEach((dot) => {
+        if (!dot.isPlaced) return;
+        const { waypoints, waterFlags, segIdx, pos, radius } = dot;
 
-      if (waypoints && waypoints.length > 1 && segIdx < waypoints.length - 1) {
-        let currentWater = waterFlags[segIdx] === 1;
-        let currentCoords = [
-          [pos[1], pos[0]],
-          [waypoints[segIdx + 1][1], waypoints[segIdx + 1][0]],
-        ];
+        if (waypoints && waypoints.length > 1 && segIdx < waypoints.length - 1) {
+          let currentWater = waterFlags[segIdx] === 1;
+          let currentCoords = [
+            [pos[1], pos[0]],
+            [waypoints[segIdx + 1][1], waypoints[segIdx + 1][0]],
+          ];
 
-        for (let i = segIdx + 1; i < waypoints.length - 1; i++) {
-          const isWater = waterFlags[i] === 1;
-          const nextPt = [waypoints[i + 1][1], waypoints[i + 1][0]];
+          for (let i = segIdx + 1; i < waypoints.length - 1; i++) {
+            const isWater = waterFlags[i] === 1;
+            const nextPt = [waypoints[i + 1][1], waypoints[i + 1][0]];
 
-          if (isWater === currentWater) {
-            currentCoords.push(nextPt);
-          } else {
+            if (isWater === currentWater) {
+              currentCoords.push(nextPt);
+            } else {
+              lineFeatures.push({
+                type: "Feature",
+                geometry: {
+                  type: "LineString",
+                  coordinates: currentCoords,
+                },
+                properties: { isWater: currentWater },
+              });
+              currentWater = isWater;
+              currentCoords = [[waypoints[i][1], waypoints[i][0]], nextPt];
+            }
+          }
+
+          if (currentCoords.length >= 2) {
             lineFeatures.push({
               type: "Feature",
               geometry: {
@@ -784,40 +354,27 @@ export default function App() {
               },
               properties: { isWater: currentWater },
             });
-            currentWater = isWater;
-            currentCoords = [[waypoints[i][1], waypoints[i][0]], nextPt];
           }
-        }
 
-        if (currentCoords.length >= 2) {
-          lineFeatures.push({
+          const dest = waypoints[waypoints.length - 1];
+          ringFeatures.push({
             type: "Feature",
             geometry: {
-              type: "LineString",
-              coordinates: currentCoords,
+              type: "Polygon",
+              coordinates: [createCircleGeoJSON(dest[0], dest[1], radius)],
             },
-            properties: { isWater: currentWater },
           });
         }
 
-        const dest = waypoints[waypoints.length - 1];
-        ringFeatures.push({
+        visionFeatures.push({
           type: "Feature",
           geometry: {
             type: "Polygon",
-            coordinates: [createCircleGeoJSON(dest[0], dest[1], radius)],
+            coordinates: [createCircleGeoJSON(pos[0], pos[1], radius)],
           },
         });
-      }
-
-      visionFeatures.push({
-        type: "Feature",
-        geometry: {
-          type: "Polygon",
-          coordinates: [createCircleGeoJSON(pos[0], pos[1], radius)],
-        },
       });
-    });
+    }
 
     const pathSource = map.getSource("unit-paths");
     if (pathSource) {
@@ -840,7 +397,6 @@ export default function App() {
   const setupLayers = (map) => {
     if (!map) return;
     const teamColor = ourTeamColorRef.current;
-    const ringColor = teamColor;
     const nextZoneColor = isSatelliteRef.current ? "#FFEA00" : "#111111";
 
     if (!map.getSource("satellite-tiles")) {
@@ -865,12 +421,10 @@ export default function App() {
       });
     }
 
-    // 1. Moving/static stripes outside the current boundary
     if (!map.getLayer("border-shrink-layer")) {
       map.addLayer(createBorderShrinkLayer(ourTeamColorRef, zoneStateRef));
     }
 
-    // 2. Static Glowing Circle of Original Non-Shrunken Boundary (Has the SAME weight as shrinking circle)
     if (!map.getSource("shrink-origin-circle-source")) {
       map.addSource("shrink-origin-circle-source", {
         type: "geojson",
@@ -882,7 +436,7 @@ export default function App() {
         type: "line",
         source: "shrink-origin-circle-source",
         paint: {
-          "line-color": ringColor,
+          "line-color": teamColor,
           "line-width": 18,
           "line-blur": 10,
           "line-opacity": 0.45,
@@ -895,7 +449,7 @@ export default function App() {
         type: "line",
         source: "shrink-origin-circle-source",
         paint: {
-          "line-color": ringColor,
+          "line-color": teamColor,
           "line-width": 7,
           "line-blur": 3,
           "line-opacity": 0.75,
@@ -908,7 +462,7 @@ export default function App() {
         type: "line",
         source: "shrink-origin-circle-source",
         paint: {
-          "line-color": ringColor,
+          "line-color": teamColor,
           "line-width": 2.5,
           "line-opacity": 1.0,
           "line-dasharray": [3, 2],
@@ -916,7 +470,6 @@ export default function App() {
       });
     }
 
-    // 3. Glowing Circle Perimeter Layers (Current Zone)
     if (!map.getSource("glowing-circle-source")) {
       map.addSource("glowing-circle-source", {
         type: "geojson",
@@ -928,7 +481,7 @@ export default function App() {
         type: "line",
         source: "glowing-circle-source",
         paint: {
-          "line-color": ringColor,
+          "line-color": teamColor,
           "line-width": 18,
           "line-blur": 10,
           "line-opacity": 0.45,
@@ -940,7 +493,7 @@ export default function App() {
         type: "line",
         source: "glowing-circle-source",
         paint: {
-          "line-color": ringColor,
+          "line-color": teamColor,
           "line-width": 7,
           "line-blur": 3,
           "line-opacity": 0.75,
@@ -952,14 +505,13 @@ export default function App() {
         type: "line",
         source: "glowing-circle-source",
         paint: {
-          "line-color": ringColor,
+          "line-color": teamColor,
           "line-width": 2.5,
           "line-opacity": 1.0,
         },
       });
     }
 
-    // 4. Glowing Dashed Next Zone Circle (Preview circle always shown until shrinking ends)
     if (!map.getSource("next-zone-circle-source")) {
       map.addSource("next-zone-circle-source", {
         type: "geojson",
@@ -992,11 +544,10 @@ export default function App() {
       });
     }
 
-    // 5. Opponent Units
     if (!map.getSource("opponent-units")) {
       map.addSource("opponent-units", {
         type: "geojson",
-        data: { type: "FeatureCollection", features: opponentFeaturesRef.current },
+        data: { type: "FeatureCollection", features: [] },
         tolerance: 0,
       });
 
@@ -1022,7 +573,6 @@ export default function App() {
       });
     }
 
-    // 6. Paths & Vision Rings
     if (!map.getSource("unit-paths")) {
       map.addSource("unit-paths", {
         type: "geojson",
@@ -1111,9 +661,8 @@ export default function App() {
       });
     }
 
-    // 7. Fog-of-War Shader Layer
     if (!map.getLayer("fog-of-war-layer")) {
-      map.addLayer(createFogLayer(dotsRef, unitsPlacedRef));
+      map.addLayer(createFogLayer(dotsRef, unitsPlacedRef, fogOpacityRef));
     }
 
     syncMapGraphics();
@@ -1135,13 +684,19 @@ export default function App() {
       center: [INITIAL_CIRCLE_CENTER_LON, INITIAL_CIRCLE_CENTER_LAT],
       zoom: 10.5,
       minZoom: 9,
-      maxZoom: 19,
+      maxZoom: 18.5,
       maxBounds: initialBounds,
       maxBoundsViscosity: 0.0,
       attributionControl: false,
     });
 
     mapRef.current = map;
+
+    // Disallow zooming when initially selecting color
+    map.scrollZoom.disable();
+    map.doubleClickZoom.disable();
+    map.touchZoomRotate.disable();
+    map.boxZoom.disable();
 
     const handleResize = () => {
       if (!mapRef.current) return;
@@ -1208,7 +763,7 @@ export default function App() {
         el.style.fontSize = "24px";
         el.style.width = "40px";
         el.style.height = "40px";
-        el.style.display = "flex";
+        el.style.display = "none";
         el.style.alignItems = "center";
         el.style.justifyContent = "center";
         el.style.userSelect = "none";
@@ -1226,18 +781,6 @@ export default function App() {
 
       initGraph()
         .then(async ({ bbox }) => {
-          const playerSnapPromises = dotsRef.current.map(() => {
-            const randLat = bbox[0][0] + Math.random() * (bbox[1][0] - bbox[0][0]);
-            const randLon = bbox[0][1] + Math.random() * (bbox[1][0] - bbox[0][1]);
-            return snap(randLat, randLon);
-          });
-
-          const playerSnaps = await Promise.all(playerSnapPromises);
-          playerSnaps.forEach((res, i) => {
-            dotsRef.current[i].pos = res.pt;
-          });
-          unitsPlacedRef.current = true;
-
           const opponentTeamColors = TEAM_COLORS.filter((c) => c !== ourTeamColorRef.current);
           const opponentPromises = [];
 
@@ -1266,13 +809,6 @@ export default function App() {
           }));
 
           opponentFeaturesRef.current = features;
-          const src = map.getSource("opponent-units");
-          if (src) {
-            src.setData({
-              type: "FeatureCollection",
-              features,
-            });
-          }
         })
         .catch((err) => console.error("Init Error:", err));
     });
@@ -1283,6 +819,7 @@ export default function App() {
       markersRef.current.clear();
       destMarkersRef.current.forEach((m) => m.remove());
       destMarkersRef.current.clear();
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
       map.remove();
       mapRef.current = null;
       isMapReadyStateRef.current = false;
@@ -1290,7 +827,7 @@ export default function App() {
     };
   }, []);
 
-  // 60 FPS Movement Loop
+  // Main 60 FPS Animation Loop
   useEffect(() => {
     let animId;
     let lastTime = performance.now();
@@ -1300,76 +837,171 @@ export default function App() {
       const dt = (now - lastTime) / 1000.0;
       lastTime = now;
 
-      const isGameFinished = gameSecondsRef.current >= END_GAME_SECONDS;
+      // 1. 3-SECOND CIRCLE EXPANSION SEQUENCE
+      if (gameStateRef.current === "INTRO") {
+        const elapsed = now - introStartRef.current;
+        const progress = Math.min(1.0, elapsed / 3000.0);
 
-      if (!isGameFinished) {
-        dotsRef.current.forEach((dot) => {
-          const { state, waypoints } = dot;
-          let segIdx = dot.segIdx;
+        const currentRadius = INITIAL_CIRCLE_RADIUS_METERS * progress;
 
-          const isFerryRedirect = state === "Redirecting" && dot.ferryTarget !== null;
-          const canMove = state === "Move" || state === "Ferry" || isFerryRedirect;
+        zoneStateRef.current = {
+          phase: 1,
+          isShrinking: false,
+          radius: currentRadius,
+          center: [INITIAL_CIRCLE_CENTER_LAT, INITIAL_CIRCLE_CENTER_LON],
+          remainingSec: 0,
+          targetEndSec: 0,
+          nextTargetR: null,
+          nextTargetCenter: null,
+          originRadius: 0,
+          originCenter: null,
+        };
 
-          if (canMove && waypoints.length > 1 && segIdx < waypoints.length - 1) {
-            let distanceToAdvance = dot.speed * (dt * TIME_SCALE);
+        // Slide in top modal exactly 1 second before PLACE_HUNTERS mode (at 2000ms)
+        if (elapsed >= 2000 && !hudSlidingInRef.current) {
+          hudSlidingInRef.current = true;
+          setHudSlidingIn(true);
+        }
 
-            while (distanceToAdvance > 0 && segIdx < waypoints.length - 1) {
-              if (isFerryRedirect && dot.ferryTarget) {
-                if (segIdx >= dot.ferryTarget.nodeIdx) {
-                  dot.pos = waypoints[dot.ferryTarget.nodeIdx];
-                  distanceToAdvance = 0;
-                  break;
-                }
-              }
+        if (elapsed >= 3000) {
+          gameStateRef.current = "PLACE_HUNTERS";
+          setGameState("PLACE_HUNTERS");
 
-              const p1 = dot.pos;
-              const p2 = waypoints[segIdx + 1];
-              const segDist = haversineMeters(p1[0], p1[1], p2[0], p2[1]);
+          zoneStateRef.current = {
+            ...getZoneState(START_GAME_SECONDS),
+            radius: INITIAL_CIRCLE_RADIUS_METERS,
+            isShrinking: false,
+            originRadius: 0,
+            nextTargetR: null,
+          };
+          setZoneUI(zoneStateRef.current);
+        }
+      }
 
-              if (distanceToAdvance < segDist) {
-                const t = distanceToAdvance / segDist;
-                dot.pos = [p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t];
-                distanceToAdvance = 0;
-              } else {
-                distanceToAdvance -= segDist;
-                dot.pos = p2;
-                segIdx++;
-                dot.segIdx = segIdx;
+      // 2. 5-SECOND FOG FADE-IN
+      if (gameStateRef.current === "FOG_FADE") {
+        const elapsed = now - fogFadeStartRef.current;
+        const progress = Math.min(1.0, elapsed / 5000.0);
+        fogOpacityRef.current = progress; // 0.0 -> 1.0
 
-                if (isFerryRedirect && dot.ferryTarget && segIdx >= dot.ferryTarget.nodeIdx) {
-                  distanceToAdvance = 0;
-                  break;
-                }
-              }
-            }
+        if (elapsed >= 5000) {
+          fogOpacityRef.current = 1.0;
+          gameStateRef.current = "COUNTDOWN";
+          setGameState("COUNTDOWN");
 
-            if (state !== "Redirecting") {
-              const isWater = dot.waterFlags[segIdx] === 1;
-              dot.state = isWater ? "Ferry" : "Move";
-            }
+          let count = 10;
+          setCountdownNumber(count);
 
-            if (segIdx >= waypoints.length - 1) {
-              dot.state = "Stop";
-              dot.waypoints = [];
-              dot.waterFlags = [];
-              dot.segIdx = 0;
-              dot.ferryTarget = null;
-              dot.preRedirectState = null;
-              dot.timeLeft = "--";
-              dot.eta = "--";
-              dot.distLeft = "--";
+          countdownIntervalRef.current = setInterval(() => {
+            count -= 1;
+            if (count > 0) {
+              setCountdownNumber(count);
             } else {
-              let remDist = haversineMeters(dot.pos[0], dot.pos[1], waypoints[segIdx + 1][0], waypoints[segIdx + 1][1]);
-              for (let i = segIdx + 1; i < waypoints.length - 1; i++) {
-                remDist += haversineMeters(waypoints[i][0], waypoints[i][1], waypoints[i + 1][0], waypoints[i + 1][1]);
+              clearInterval(countdownIntervalRef.current);
+              countdownIntervalRef.current = null;
+              gameStateRef.current = "PLAYING";
+              setGameState("PLAYING");
+
+              // Reveal opponent units when the game starts
+              const map = mapRef.current;
+              if (map) {
+                const src = map.getSource("opponent-units");
+                if (src) {
+                  src.setData({
+                    type: "FeatureCollection",
+                    features: opponentFeaturesRef.current,
+                  });
+                }
               }
-              const remGameSeconds = remDist / dot.speed;
-              dot.timeLeft = formatDurationRounded(remGameSeconds);
-              dot.eta = formatEtaRounded(gameSecondsRef.current + remGameSeconds);
-              dot.distLeft = remDist > 1000 ? (remDist / 1000).toFixed(2) + " km" : remDist.toFixed(0) + " m";
             }
-          }
-        });
+          }, 1000);
+        }
+      }
+
+      // 3. UNIT MOVEMENT IN PLAYING STATE
+      if (gameStateRef.current === "PLAYING") {
+        const isGameFinished = gameSecondsRef.current >= END_GAME_SECONDS;
+
+        if (!isGameFinished) {
+          dotsRef.current.forEach((dot) => {
+            const { state, waypoints } = dot;
+            let segIdx = dot.segIdx;
+
+            const isFerryRedirect = state === "Redirecting" && dot.ferryTarget !== null;
+            const canMove = state === "Move" || state === "Ferry" || isFerryRedirect;
+
+            if (canMove && waypoints.length > 1 && segIdx < waypoints.length - 1) {
+              let distanceToAdvance = dot.speed * (dt * TIME_SCALE);
+
+              while (distanceToAdvance > 0 && segIdx < waypoints.length - 1) {
+                if (isFerryRedirect && dot.ferryTarget) {
+                  if (segIdx >= dot.ferryTarget.nodeIdx) {
+                    dot.pos = waypoints[dot.ferryTarget.nodeIdx];
+                    distanceToAdvance = 0;
+                    break;
+                  }
+                }
+
+                const p1 = dot.pos;
+                const p2 = waypoints[segIdx + 1];
+                const segDist = haversineMeters(p1[0], p1[1], p2[0], p2[1]);
+
+                if (distanceToAdvance < segDist) {
+                  const t = distanceToAdvance / segDist;
+                  dot.pos = [p1[0] + (p2[0] - p1[0]) * t, p1[1] + (p2[1] - p1[1]) * t];
+                  distanceToAdvance = 0;
+                } else {
+                  distanceToAdvance -= segDist;
+                  dot.pos = p2;
+                  segIdx++;
+                  dot.segIdx = segIdx;
+
+                  if (isFerryRedirect && dot.ferryTarget && segIdx >= dot.ferryTarget.nodeIdx) {
+                    distanceToAdvance = 0;
+                    break;
+                  }
+                }
+              }
+
+              if (state !== "Redirecting") {
+                const isWater = dot.waterFlags[segIdx] === 1;
+                dot.state = isWater ? "Ferry" : "Move";
+              }
+
+              if (segIdx >= waypoints.length - 1) {
+                dot.state = "Stop";
+                dot.waypoints = [];
+                dot.waterFlags = [];
+                dot.segIdx = 0;
+                dot.ferryTarget = null;
+                dot.preRedirectState = null;
+                dot.timeLeft = "--";
+                dot.eta = "--";
+                dot.distLeft = "--";
+              } else {
+                let remDist = haversineMeters(
+                  dot.pos[0],
+                  dot.pos[1],
+                  waypoints[segIdx + 1][0],
+                  waypoints[segIdx + 1][1]
+                );
+                for (let i = segIdx + 1; i < waypoints.length - 1; i++) {
+                  remDist += haversineMeters(
+                    waypoints[i][0],
+                    waypoints[i][1],
+                    waypoints[i + 1][0],
+                    waypoints[i + 1][1]
+                  );
+                }
+                const remGameSeconds = remDist / dot.speed;
+                dot.timeLeft = formatDurationRounded(remGameSeconds);
+                dot.eta = formatEtaRounded(gameSecondsRef.current + remGameSeconds);
+                dot.distLeft =
+                  remDist > 1000 ? (remDist / 1000).toFixed(2) + " km" : remDist.toFixed(0) + " m";
+              }
+            }
+          });
+        }
       }
 
       syncMapGraphics();
@@ -1399,7 +1031,70 @@ export default function App() {
     return () => cancelAnimationFrame(animId);
   }, []);
 
-  // Selection styling
+  const updateMapTeamColor = (color) => {
+    ourTeamColorRef.current = color;
+    setOurTeamColor(color);
+
+    const map = mapRef.current;
+    if (!map) return;
+
+    [
+      "glowing-circle-outer",
+      "glowing-circle-mid",
+      "glowing-circle-core",
+      "shrink-origin-circle-outer",
+      "shrink-origin-circle-mid",
+      "shrink-origin-circle-core",
+      "dest-rings-layer",
+      "vision-circles-stroke",
+    ].forEach((layerId) => {
+      if (map.getLayer(layerId)) {
+        map.setPaintProperty(layerId, "line-color", color);
+      }
+    });
+
+    if (map.getLayer("vision-circles-fill")) {
+      map.setPaintProperty("vision-circles-fill", "fill-color", color);
+    }
+
+    markersRef.current.forEach((marker) => {
+      const el = marker.getElement();
+      el.style.filter = `drop-shadow(0 0 6px ${color})`;
+    });
+  };
+
+  const handleSelectTeamColor = (color) => {
+    setSelectedColor(color);
+    updateMapTeamColor(color);
+  };
+
+  const handlePressPlay = () => {
+    if (!selectedColor) return;
+    introStartRef.current = performance.now();
+    gameStateRef.current = "INTRO";
+    setGameState("INTRO");
+  };
+
+  const handleConfirmHunters = () => {
+    if (placedHuntersCount < 3) return;
+    gameStateRef.current = "PLACE_RUNNER";
+    setGameState("PLACE_RUNNER");
+  };
+
+  // Confirm runner: start 5s fog fade, reveal clock and normal progress text immediately
+  const handleConfirmRunner = () => {
+    if (!runnerPlaced) return;
+    unitsPlacedRef.current = true;
+
+    const initialZone = getZoneState(START_GAME_SECONDS);
+    zoneStateRef.current = initialZone;
+    setZoneUI(initialZone);
+
+    fogFadeStartRef.current = performance.now();
+    gameStateRef.current = "FOG_FADE";
+    setGameState("FOG_FADE");
+  };
+
   useEffect(() => {
     const color = ourTeamColorRef.current;
 
@@ -1462,7 +1157,7 @@ export default function App() {
       ];
 
       const dot = dotsRef.current[id];
-      if (dot) {
+      if (dot && dot.isPlaced) {
         map.panTo([dot.pos[1], dot.pos[0]], { duration: 400 });
       }
     }
@@ -1481,13 +1176,17 @@ export default function App() {
       map.setStyle(nextSatellite ? SATELLITE_STYLE : MAP_STYLE);
     }
 
-    const newGlowColor = ourTeamColor;
+    const currentTeamColor = ourTeamColorRef.current;
     [
-      "glowing-circle-outer", "glowing-circle-mid", "glowing-circle-core",
-      "shrink-origin-circle-outer", "shrink-origin-circle-mid", "shrink-origin-circle-core"
+      "glowing-circle-outer",
+      "glowing-circle-mid",
+      "glowing-circle-core",
+      "shrink-origin-circle-outer",
+      "shrink-origin-circle-mid",
+      "shrink-origin-circle-core",
     ].forEach((layerId) => {
       if (map.getLayer(layerId)) {
-        map.setPaintProperty(layerId, "line-color", newGlowColor);
+        map.setPaintProperty(layerId, "line-color", currentTeamColor);
       }
     });
 
@@ -1499,103 +1198,163 @@ export default function App() {
     });
   };
 
-  // Map Click Rerouting
+  // Map Click Handling
   useEffect(() => {
     if (!mapRef.current) return;
 
     const onMapClick = async (e) => {
-      if (gameSecondsRef.current >= END_GAME_SECONDS) return;
-
-      const activeId = selectedIdRef.current;
-      if (activeId === null) return;
-
-      const dot = dotsRef.current[activeId];
-      const now = performance.now();
-
-      if (now < dot.nextAllowedClick || dot.state === "Redirecting") return;
-
+      const curState = gameStateRef.current;
       const { lat: clickLat, lng: clickLon } = e.lngLat;
-      const curState = dot.state;
-      const waypoints = dot.waypoints;
-      const flags = dot.waterFlags;
-      const curSeg = dot.segIdx;
 
-      dot.preRedirectState = curState;
-      dot.redirectRequestId = (dot.redirectRequestId || 0) + 1;
-      const reqId = dot.redirectRequestId;
+      if (curState === "PLACE_HUNTERS") {
+        if (isSnappingRef.current) return;
+        isSnappingRef.current = true;
 
-      dot.redirectStart = performance.now();
+        try {
+          const snapped = await snap(clickLat, clickLon);
+          const targetHunterId = hunterClickCountRef.current % 3;
+          const unit = dotsRef.current[targetHunterId];
 
-      if (curState === "Ferry") {
-        let bIdx = waypoints.length - 1;
-        for (let i = curSeg; i < flags.length; i++) {
-          if (flags[i] === 0) {
-            bIdx = i;
-            break;
+          unit.pos = snapped.pt;
+          unit.isPlaced = true;
+
+          const marker = markersRef.current.get(targetHunterId);
+          if (marker) {
+            marker.setLngLat([snapped.pt[1], snapped.pt[0]]);
+            marker.getElement().style.display = "flex";
           }
+
+          hunterClickCountRef.current += 1;
+          setPlacedHuntersCount((prev) => Math.max(prev, hunterClickCountRef.current));
+          syncMapGraphics();
+        } catch (err) {
+          console.error("Snap error:", err);
+        } finally {
+          isSnappingRef.current = false;
         }
+        return;
+      }
 
-        const nodeBCoord = waypoints[bIdx];
-        dot.ferryTarget = { nodeIdx: bIdx, coord: nodeBCoord };
-        dot.state = "Redirecting";
+      if (curState === "PLACE_RUNNER") {
+        if (isSnappingRef.current) return;
+        isSnappingRef.current = true;
 
-        const snapC = await snap(clickLat, clickLon);
-        const snapB = await snap(nodeBCoord[0], nodeBCoord[1]);
-        const { flatPolyline: bToCFlat, waterFlags: bToCFlags } = await pathfind(snapB, snapC);
+        try {
+          const snapped = await snap(clickLat, clickLon);
+          const runnerUnit = dotsRef.current[3];
 
-        if (dot.redirectRequestId !== reqId || dot.state !== "Redirecting") return;
+          runnerUnit.pos = snapped.pt;
+          runnerUnit.isPlaced = true;
 
-        const bToCWaypoints = [];
-        for (let i = 0; i < bToCFlat.length; i += 2) {
-          bToCWaypoints.push([bToCFlat[i], bToCFlat[i + 1]]);
+          const marker = markersRef.current.get(3);
+          if (marker) {
+            marker.setLngLat([snapped.pt[1], snapped.pt[0]]);
+            marker.getElement().style.display = "flex";
+          }
+
+          setRunnerPlaced(true);
+          syncMapGraphics();
+        } catch (err) {
+          console.error("Snap error:", err);
+        } finally {
+          isSnappingRef.current = false;
         }
+        return;
+      }
 
-        const pointF = dot.pos;
-        const currentSegNow = dot.segIdx;
+      if (curState === "PLAYING") {
+        if (gameSecondsRef.current >= END_GAME_SECONDS) return;
 
-        let remainingToB = [pointF];
-        let remainingFlagsToB = [];
+        const activeId = selectedIdRef.current;
+        if (activeId === null) return;
 
-        if (currentSegNow < bIdx) {
-          for (let i = currentSegNow + 1; i <= bIdx; i++) remainingToB.push(waypoints[i]);
-          for (let i = currentSegNow; i < bIdx; i++) remainingFlagsToB.push(flags[i]);
+        const dot = dotsRef.current[activeId];
+        const now = performance.now();
+
+        if (now < dot.nextAllowedClick || dot.state === "Redirecting") return;
+
+        const unitCurState = dot.state;
+        const waypoints = dot.waypoints;
+        const flags = dot.waterFlags;
+        const curSeg = dot.segIdx;
+
+        dot.preRedirectState = unitCurState;
+        dot.redirectRequestId = (dot.redirectRequestId || 0) + 1;
+        const reqId = dot.redirectRequestId;
+
+        dot.redirectStart = performance.now();
+
+        if (unitCurState === "Ferry") {
+          let bIdx = waypoints.length - 1;
+          for (let i = curSeg; i < flags.length; i++) {
+            if (flags[i] === 0) {
+              bIdx = i;
+              break;
+            }
+          }
+
+          const nodeBCoord = waypoints[bIdx];
+          dot.ferryTarget = { nodeIdx: bIdx, coord: nodeBCoord };
+          dot.state = "Redirecting";
+
+          const snapC = await snap(clickLat, clickLon);
+          const snapB = await snap(nodeBCoord[0], nodeBCoord[1]);
+          const { flatPolyline: bToCFlat, waterFlags: bToCFlags } = await pathfind(snapB, snapC);
+
+          if (dot.redirectRequestId !== reqId || dot.state !== "Redirecting") return;
+
+          const bToCWaypoints = [];
+          for (let i = 0; i < bToCFlat.length; i += 2) {
+            bToCWaypoints.push([bToCFlat[i], bToCFlat[i + 1]]);
+          }
+
+          const pointF = dot.pos;
+          const currentSegNow = dot.segIdx;
+
+          let remainingToB = [pointF];
+          let remainingFlagsToB = [];
+
+          if (currentSegNow < bIdx) {
+            for (let i = currentSegNow + 1; i <= bIdx; i++) remainingToB.push(waypoints[i]);
+            for (let i = currentSegNow; i < bIdx; i++) remainingFlagsToB.push(flags[i]);
+          }
+
+          const newWaypoints = [...remainingToB, ...bToCWaypoints.slice(1)];
+          const newFlags = [...remainingFlagsToB, ...Array.from(bToCFlags)];
+
+          dot.waypoints = newWaypoints;
+          dot.waterFlags = newFlags;
+          dot.segIdx = 0;
+          dot.pos = newWaypoints[0];
+          dot.ferryTarget = null;
+          dot.preRedirectState = null;
+
+          dot.nextAllowedClick = performance.now() + 200;
+          dot.state = newFlags[0] === 1 ? "Ferry" : "Move";
+        } else {
+          dot.state = "Redirecting";
+
+          const startPos = dot.pos;
+          const snapC = await snap(clickLat, clickLon);
+          const snapStart = await snap(startPos[0], startPos[1]);
+          const { flatPolyline, waterFlags } = await pathfind(snapStart, snapC);
+
+          if (dot.redirectRequestId !== reqId || dot.state !== "Redirecting") return;
+
+          const newWaypoints = [];
+          for (let i = 0; i < flatPolyline.length; i += 2) {
+            newWaypoints.push([flatPolyline[i], flatPolyline[i + 1]]);
+          }
+
+          dot.waypoints = newWaypoints;
+          dot.waterFlags = Array.from(waterFlags);
+          dot.segIdx = 0;
+          dot.pos = newWaypoints[0];
+          dot.preRedirectState = null;
+
+          dot.nextAllowedClick = performance.now() + 200;
+          dot.state = waterFlags[0] === 1 ? "Ferry" : "Move";
         }
-
-        const newWaypoints = [...remainingToB, ...bToCWaypoints.slice(1)];
-        const newFlags = [...remainingFlagsToB, ...Array.from(bToCFlags)];
-
-        dot.waypoints = newWaypoints;
-        dot.waterFlags = newFlags;
-        dot.segIdx = 0;
-        dot.pos = newWaypoints[0];
-        dot.ferryTarget = null;
-        dot.preRedirectState = null;
-
-        dot.nextAllowedClick = performance.now() + 200;
-        dot.state = newFlags[0] === 1 ? "Ferry" : "Move";
-      } else {
-        dot.state = "Redirecting";
-
-        const startPos = dot.pos;
-        const snapC = await snap(clickLat, clickLon);
-        const snapStart = await snap(startPos[0], startPos[1]);
-        const { flatPolyline, waterFlags } = await pathfind(snapStart, snapC);
-
-        if (dot.redirectRequestId !== reqId || dot.state !== "Redirecting") return;
-
-        const newWaypoints = [];
-        for (let i = 0; i < flatPolyline.length; i += 2) {
-          newWaypoints.push([flatPolyline[i], flatPolyline[i + 1]]);
-        }
-
-        dot.waypoints = newWaypoints;
-        dot.waterFlags = Array.from(waterFlags);
-        dot.segIdx = 0;
-        dot.pos = newWaypoints[0];
-        dot.preRedirectState = null;
-
-        dot.nextAllowedClick = performance.now() + 200;
-        dot.state = waterFlags[0] === 1 ? "Ferry" : "Move";
       }
     };
 
@@ -1620,7 +1379,7 @@ export default function App() {
     e.stopPropagation();
     const dot = dotsRef.current[id];
     if (dot) {
-      dot.sight = (dot.sight || 800) + 100;
+      dot.sight = (dot.sight || 200) + 100;
       syncMapGraphics();
     }
   };
@@ -1704,21 +1463,37 @@ export default function App() {
 
   const selectedDotUI = dotsUI.find((d) => d.id === selectedId);
 
-  // Radius progress: 0% at Initial Radius, 100% at 0m
   const currentRadius = zoneUI.radius;
   const radiusProgressRatio = Math.min(
     Math.max(1.0 - currentRadius / INITIAL_CIRCLE_RADIUS_METERS, 0.0),
     1.0
   );
 
-  const zoneSymbol = zoneUI.isShrinking ? "⏩" : "⏸️";
-  const nextZoneSymbol = zoneUI.isShrinking ? "⏸️" : "⏩";
-  const diameterText = formatRadiusDisplay(currentRadius * 2);
-  const timeUntilText = formatDurationRounded(zoneUI.remainingSec);
-  const endTimeText = formatEtaRounded(zoneUI.targetEndSec);
+  const displayedDiameter = formatRadiusDisplay(INITIAL_CIRCLE_RADIUS_METERS * 2);
 
-  // Status format: "Z1 ⏩ (48.1km, 1h-55m until ⏸️ at HH:MM)"
-  const zoneStatusText = `Z${zoneUI.phase} ${zoneSymbol} (${diameterText}, ${timeUntilText} until ${nextZoneSymbol} at ${endTimeText})`;
+  // Determine whether top text should show hunter/runner placement or clock
+  const isHunterPhaseText = gameState === "INTRO" || gameState === "PLACE_HUNTERS";
+  const isRunnerPhaseText = gameState === "PLACE_RUNNER";
+  const isStaticPlacementBar = isHunterPhaseText || isRunnerPhaseText;
+  const isActualPlacementInteraction = gameState === "PLACE_HUNTERS" || gameState === "PLACE_RUNNER";
+
+  // Top header text logic (displays "Place Your Hunters!" as it slides down 1s prior)
+  let headerText = formatGameClock(gameSeconds);
+  if (isHunterPhaseText) headerText = "Place Your Hunters!";
+  else if (isRunnerPhaseText) headerText = "Place Your Runner!";
+  else if (gameState === "FOG_FADE" || gameState === "COUNTDOWN") headerText = formatGameClock(START_GAME_SECONDS);
+
+  // Progress bar text logic (displays "Z1 ⏸️ ({d})" as it slides down 1s prior)
+  let progressText = isStaticPlacementBar
+    ? `Z1 ⏸️ (${displayedDiameter})`
+    : `Z${zoneUI.phase} ${zoneUI.isShrinking ? "⏩" : "⏸️"} (${formatRadiusDisplay(
+        currentRadius * 2
+      )}, ${formatDurationRounded(zoneUI.remainingSec)} until ${
+        zoneUI.isShrinking ? "⏸️" : "⏩"
+      } at ${formatEtaRounded(zoneUI.targetEndSec)})`;
+
+  // Modal visibility: drops down 1 second before PLACE_HUNTERS mode begins (at 2000ms)
+  const isHUDVisible = hudSlidingIn || (gameState !== "INITIAL" && gameState !== "INTRO");
 
   return (
     <div
@@ -1734,7 +1509,6 @@ export default function App() {
         backgroundColor: "#1a1a1a",
       }}
     >
-      {/* Dynamic Keyframes for the Progress Bar Horizontal Striped Movement */}
       <style>{`
         @keyframes moveStripes {
           0% { background-position: 0 0; }
@@ -1754,26 +1528,154 @@ export default function App() {
         }}
       />
 
-      {/* Top Center: Game Time and Black-Outlined Progress Bar */}
+      {/* 3x4 COLOR PICKER MODAL (INITIAL STATE) */}
+      {gameState === "INITIAL" && (
+        <div
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            transform: "translate(-50%, -50%)",
+            zIndex: 60,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            padding: "24px 28px",
+            background: "rgba(18, 20, 24, 0.88)",
+            backdropFilter: "blur(14px)",
+            borderRadius: "20px",
+            border: `2px solid ${selectedColor || "rgba(255, 255, 255, 0.2)"}`,
+            boxShadow: selectedColor
+              ? `0 0 25px ${selectedColor}66, 0 8px 32px rgba(0,0,0,0.7)`
+              : "0 8px 32px rgba(0,0,0,0.7)",
+            fontFamily: "system-ui, -apple-system, sans-serif",
+            userSelect: "none",
+            transition: "border 0.2s ease, box-shadow 0.2s ease",
+          }}
+        >
+          <div
+            style={{
+              fontSize: "13px",
+              fontWeight: "700",
+              letterSpacing: "1.5px",
+              color: "#a0a5b0",
+              textTransform: "uppercase",
+              marginBottom: "16px",
+            }}
+          >
+            Select Team Color
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(4, 52px)",
+              gridTemplateRows: "repeat(3, 52px)",
+              gap: "12px",
+              marginBottom: "20px",
+            }}
+          >
+            {TEAM_COLORS.map((color) => {
+              const isSelected = selectedColor === color;
+              return (
+                <button
+                  key={color}
+                  onClick={() => handleSelectTeamColor(color)}
+                  style={{
+                    width: "52px",
+                    height: "52px",
+                    borderRadius: "14px",
+                    backgroundColor: color,
+                    border: isSelected
+                      ? "3.5px solid #ffffff"
+                      : "2px solid rgba(0, 0, 0, 0.4)",
+                    boxShadow: isSelected
+                      ? `0 0 14px ${color}, inset 0 0 4px rgba(0,0,0,0.4)`
+                      : "0 2px 6px rgba(0,0,0,0.3)",
+                    transform: isSelected ? "scale(1.08)" : "scale(1)",
+                    cursor: "pointer",
+                    outline: "none",
+                    padding: 0,
+                    transition: "transform 0.15s ease, border 0.15s ease, box-shadow 0.15s ease",
+                  }}
+                />
+              );
+            })}
+          </div>
+
+          <button
+            onClick={handlePressPlay}
+            disabled={!selectedColor}
+            style={{
+              padding: "10px 42px",
+              fontSize: "16px",
+              fontWeight: "800",
+              letterSpacing: "1px",
+              borderRadius: "24px",
+              border: "none",
+              backgroundColor: selectedColor ? selectedColor : "#3a3d45",
+              color: "#ffffff",
+              cursor: selectedColor ? "pointer" : "not-allowed",
+              boxShadow: selectedColor ? `0 4px 16px ${selectedColor}88` : "none",
+              opacity: selectedColor ? 1 : 0.4,
+              transition: "all 0.2s ease",
+              outline: "none",
+            }}
+          >
+            PLAY
+          </button>
+        </div>
+      )}
+
+      {/* COUNTDOWN NUMBER IN THE CENTER */}
+      {gameState === "COUNTDOWN" && (
+        <div
+          style={{
+            position: "absolute",
+            top: "50%",
+            left: "50%",
+            transform: "translate(-50%, -50%)",
+            zIndex: 80,
+            fontSize: "110px",
+            fontWeight: "900",
+            WebkitTextStroke: "6px #000000",
+            paintOrder: "stroke fill",
+            color: "#ffffff",
+            fontFamily: "system-ui, -apple-system, sans-serif",
+            fontVariantNumeric: "tabular-nums",
+            userSelect: "none",
+            pointerEvents: "none",
+            textShadow:
+              "-3px -3px 0 #000, 3px -3px 0 #000, -3px 3px 0 #000, 3px 3px 0 #000, 0 8px 24px rgba(0,0,0,0.9)",
+          }}
+        >
+          {countdownNumber}
+        </div>
+      )}
+
+      {/* TOP CENTER: HEADER TEXT & PROGRESS BAR (Slides in 1s before PLACE_HUNTERS mode) */}
       <div
         style={{
           position: "absolute",
           top: "calc(16px + env(safe-area-inset-top, 0px))",
           left: "50%",
-          transform: "translateX(-50%)",
+          transform: isHUDVisible ? "translate(-50%, 0)" : "translate(-50%, -200%)",
+          opacity: isHUDVisible ? 1 : 0,
+          transition: "transform 1s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.5s ease",
           zIndex: 40,
           display: "flex",
           flexDirection: "column",
           alignItems: "center",
           fontFamily: "system-ui, -apple-system, sans-serif",
           userSelect: "none",
-          minWidth: "260px",
+          minWidth: "240px",
           background: "transparent",
+          pointerEvents: isHUDVisible ? "auto" : "none",
         }}
       >
         <span
           style={{
-            fontSize: "24px",
+            fontSize: isStaticPlacementBar ? "20px" : "24px",
             fontWeight: "800",
             letterSpacing: "0.8px",
             color: "#ffffff",
@@ -1782,10 +1684,9 @@ export default function App() {
               "-1.5px -1.5px 0 #000, 1.5px -1.5px 0 #000, -1.5px 1.5px 0 #000, 1.5px 1.5px 0 #000, 0 2px 5px rgba(0,0,0,0.85)",
           }}
         >
-          {formatGameClock(gameSeconds)}
+          {headerText}
         </span>
 
-        {/* Progress Bar Container with Black Outline */}
         <div
           style={{
             position: "relative",
@@ -1798,14 +1699,13 @@ export default function App() {
             boxShadow: "0 0 0 1.5px #000000, 0 2px 6px rgba(0,0,0,0.6)",
           }}
         >
-          {/* Filled Striped Bar (Animated when shrinking, static when paused) */}
           <div
             style={{
               position: "absolute",
               top: 0,
               left: 0,
               height: "100%",
-              width: `${(radiusProgressRatio * 100).toFixed(2)}%`,
+              width: `${isStaticPlacementBar ? 0 : (radiusProgressRatio * 100).toFixed(2)}%`,
               backgroundColor: ourTeamColor,
               backgroundImage: `repeating-linear-gradient(
                 -45deg,
@@ -1820,7 +1720,6 @@ export default function App() {
             }}
           />
 
-          {/* Centered Dynamic Stage / Radius Status with dark text outline */}
           <span
             style={{
               position: "absolute",
@@ -1836,19 +1735,53 @@ export default function App() {
               whiteSpace: "nowrap",
             }}
           >
-            {zoneStatusText}
+            {progressText}
           </span>
         </div>
       </div>
 
-      {/* Top-Left Style Toggle Button */}
+      {/* BOTTOM CONFIRM BUTTON */}
+      {isActualPlacementInteraction && (
+        <button
+          onClick={gameState === "PLACE_HUNTERS" ? handleConfirmHunters : handleConfirmRunner}
+          disabled={gameState === "PLACE_HUNTERS" ? placedHuntersCount < 3 : !runnerPlaced}
+          style={{
+            position: "absolute",
+            bottom: "calc(24px + env(safe-area-inset-bottom, 0px))",
+            left: "50%",
+            transform: "translateX(-50%)",
+            padding: "12px 42px",
+            fontSize: "16px",
+            fontWeight: "800",
+            letterSpacing: "1.2px",
+            borderRadius: "28px",
+            border: "none",
+            backgroundColor: ourTeamColor,
+            color: "#ffffff",
+            boxShadow: `0 4px 20px ${ourTeamColor}88, 0 2px 8px rgba(0,0,0,0.6)`,
+            cursor:
+              (gameState === "PLACE_HUNTERS" ? placedHuntersCount >= 3 : runnerPlaced)
+                ? "pointer"
+                : "not-allowed",
+            opacity:
+              (gameState === "PLACE_HUNTERS" ? placedHuntersCount >= 3 : runnerPlaced) ? 1 : 0.45,
+            zIndex: 60,
+            transition: "all 0.2s ease",
+            outline: "none",
+          }}
+        >
+          CONFIRM
+        </button>
+      )}
+
+      {/* TOP-LEFT WHITE BUTTON: NEVER DISAPPEARS */}
       <button
         onClick={handleToggleStyle}
         style={{
           position: "absolute",
           top: "calc(16px + env(safe-area-inset-top, 0px))",
           left: 16,
-          zIndex: 40,
+          zIndex: 65,
           width: "48px",
           height: "48px",
           borderRadius: "50%",
@@ -1863,23 +1796,26 @@ export default function App() {
           outline: "none",
           userSelect: "none",
           padding: 0,
-          transition: "transform 0.15s ease",
         }}
         title={isSatellite ? "Switch to Map" : "Switch to Satellite"}
       >
         {isSatellite ? "🗺️" : "🌍"}
       </button>
 
-      {/* Unit Selection Toolbar */}
+      {/* UNIT SELECTION TOOLBAR */}
       <div
         style={{
           position: "absolute",
           bottom: "calc(16px + env(safe-area-inset-bottom, 0px))",
           left: 16,
+          transform: gameState === "PLAYING" ? "translateX(0)" : "translateX(-150px)",
+          opacity: gameState === "PLAYING" ? 1 : 0,
+          transition: "transform 1s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.5s ease",
           zIndex: 40,
           display: "flex",
           flexDirection: "column",
           gap: "10px",
+          pointerEvents: gameState === "PLAYING" ? "auto" : "none",
         }}
       >
         {dotsUI.map((dot) => {
@@ -1915,7 +1851,7 @@ export default function App() {
         })}
       </div>
 
-      {/* Bottom Tactical Drawer */}
+      {/* BOTTOM TACTICAL DRAWER */}
       <div
         style={{
           position: "absolute",
@@ -1936,9 +1872,9 @@ export default function App() {
           justifyContent: "space-between",
           flexWrap: "wrap",
           gap: "12px",
-          transform: selectedDotUI ? "translateY(0)" : "translateY(110%)",
+          transform: selectedDotUI && gameState === "PLAYING" ? "translateY(0)" : "translateY(110%)",
           transition: "transform 0.3s cubic-bezier(0.16, 1, 0.3, 1)",
-          pointerEvents: selectedDotUI ? "auto" : "none",
+          pointerEvents: selectedDotUI && gameState === "PLAYING" ? "auto" : "none",
         }}
       >
         {selectedDotUI && (
@@ -1980,15 +1916,15 @@ export default function App() {
               </div>
               <div style={{ fontSize: "12px", color: "#333" }}>
                 <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Speed</span>
-                <b>{selectedDotUI.speed} m/s</b>
+                <b>{selectedDotUI.speed}m/s</b>
               </div>
               <div style={{ fontSize: "12px", color: "#333" }}>
                 <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Reach</span>
-                <b>{selectedDotUI.radius} m</b>
+                <b>{selectedDotUI.radius}m</b>
               </div>
               <div style={{ fontSize: "12px", color: "#333" }}>
                 <span style={{ fontSize: "10px", color: "#888", display: "block" }}>Sight</span>
-                <b>{selectedDotUI.sight} m</b>
+                <b>{selectedDotUI.sight}m</b>
               </div>
             </div>
 
