@@ -2,8 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { initGraph, snap, pathfind } from "./fetch";
-import PreGameModals from "./PreGameModals";
-import MultiplayerModals from "./MultiplayerModals";
+import GameModals from "./GameModals";
 import {
   tobackend,
   pickRandomColor,
@@ -35,115 +34,6 @@ import {
 const GREY_STORM_COLOR = "#60646c";
 
 export default function App() {
-  const [multiplayerPage, setMultiplayerPage] = useState("LANDING");
-  const [playerName, setPlayerName] = useState("");
-  const [roomData, setRoomData] = useState(null);
-  const [localPlayerId, setLocalPlayerId] = useState(null);
-
-  // ---------------- MULTIPLAYER EVENT HANDLERS ----------------
-  const handleCreateRoom = (name) => {
-    const newCode = Math.floor(1000 + Math.random() * 9000).toString();
-    const myId = "p_1";
-    const myColor = pickRandomColor([]);
-
-    const newRoom = {
-      code: newCode,
-      hostId: myId,
-      players: [
-        {
-          id: myId,
-          numericId: 1,
-          name,
-          color: myColor,
-        },
-      ],
-    };
-
-    setLocalPlayerId(myId);
-    setRoomData(newRoom);
-    setOurTeamColor(myColor);
-    ourTeamColorRef.current = myColor;
-    setMultiplayerPage("ROOM");
-
-    tobackend({ action: "CREATE_ROOM", playerName: name, room: newRoom });
-  };
-
-  const handleJoinRoomSubmit = (code) => {
-    const myId = `p_${Date.now() % 1000}`;
-    const myColor = pickRandomColor([]);
-
-    // Mock existing room players for demonstration
-    const dummyRoom = {
-      code,
-      hostId: "p_host",
-      players: [
-        { id: "p_host", numericId: 1, name: "Alice", color: "#FF5722" },
-        { id: "p_2", numericId: 2, name: "Andrew", color: "#4CAF50" },
-        { id: myId, numericId: 3, name: playerName, color: myColor },
-      ],
-    };
-
-    setLocalPlayerId(myId);
-    setRoomData(dummyRoom);
-    setOurTeamColor(myColor);
-    ourTeamColorRef.current = myColor;
-    setMultiplayerPage("ROOM");
-
-    tobackend({ action: "JOIN_ROOM", roomCode: code, playerName, player: { id: myId, name: playerName } });
-  };
-
-  const handleLeaveRoom = () => {
-    tobackend({ action: "LEAVE_ROOM", roomCode: roomData?.code, localPlayerId });
-    setRoomData(null);
-    setLocalPlayerId(null);
-    setMultiplayerPage("LANDING");
-  };
-
-  const handleReassignHost = () => {
-    if (!roomData || roomData.players.length <= 1) return;
-    const otherPlayers = roomData.players.filter((p) => p.id !== roomData.hostId);
-    const nextHost = otherPlayers[0];
-
-    const updated = {
-      ...roomData,
-      hostId: nextHost.id,
-    };
-    setRoomData(updated);
-
-    tobackend({ action: "REASSIGN_HOST", roomCode: roomData.code, newHostId: nextHost.id });
-  };
-
-  const handleRoomColorSelect = (newColor) => {
-    // 1. Update Map and Team Colors
-    updateMapTeamColor(newColor);
-    setSelectedColor(newColor);
-
-    // 2. Update room player data state
-    if (roomData && localPlayerId) {
-      const updatedPlayers = roomData.players.map((p) =>
-        p.id === localPlayerId ? { ...p, color: newColor } : p
-      );
-      setRoomData({
-        ...roomData,
-        players: updatedPlayers,
-      });
-
-      // 3. Dispatch to backend
-      tobackend({
-        action: "CHANGE_COLOR",
-        roomCode: roomData.code,
-        playerId: localPlayerId,
-        newColor,
-      });
-    }
-  };
-
-  const handleStartGame = () => {
-    tobackend({ action: "START_GAME", roomCode: roomData.code });
-    setMultiplayerPage(null); // dismiss multiplayer modal
-    handlePressPlay(); // trigger existing intro sequence
-  };
-
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
   const isMapReadyStateRef = useRef(false);
@@ -154,9 +44,15 @@ export default function App() {
 
   const selectionOrderRef = useRef(DOT_CONFIGS.map((c) => c.id));
 
-  // Game sequence: "INITIAL" | "INTRO" | "PLACE_HUNTERS" | "PLACE_RUNNER" | "FOG_FADE" | "COUNTDOWN" | "PLAYING"
-  const [gameState, setGameState] = useState("INITIAL");
-  const gameStateRef = useRef("INITIAL");
+  // Single Unified Sequence:
+  // "LANDING" | "JOIN_ROOM" | "ROOM" | "INTRO" | "PLACE_HUNTERS" | "PLACE_RUNNER" | "FOG_FADE" | "COUNTDOWN" | "PLAYING"
+  const [gameState, setGameState] = useState("LANDING");
+  const gameStateRef = useRef("LANDING");
+
+  // Multiplayer Room State
+  const [playerName, setPlayerName] = useState("");
+  const [roomData, setRoomData] = useState(null);
+  const [localPlayerId, setLocalPlayerId] = useState(null);
 
   // Dynamic fog opacity reference
   const fogOpacityRef = useRef(0.0);
@@ -172,7 +68,6 @@ export default function App() {
   const [runnerPlaced, setRunnerPlaced] = useState(false);
   const isSnappingRef = useRef(false);
 
-  const [selectedColor, setSelectedColor] = useState(null);
   const [ourTeamColor, setOurTeamColor] = useState(GREY_STORM_COLOR);
   const ourTeamColorRef = useRef(GREY_STORM_COLOR);
 
@@ -238,11 +133,14 @@ export default function App() {
     }))
   );
 
-  // Lock and unlock zoom depending on color selection state
+  const isLobbyState =
+    gameState === "LANDING" || gameState === "JOIN_ROOM" || gameState === "ROOM";
+
+  // Lock map interactions in lobby
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    if (gameState === "INITIAL") {
+    if (isLobbyState) {
       map.scrollZoom.disable();
       map.doubleClickZoom.disable();
       map.touchZoomRotate.disable();
@@ -253,7 +151,7 @@ export default function App() {
       map.touchZoomRotate.enable();
       map.boxZoom.enable();
     }
-  }, [gameState]);
+  }, [isLobbyState]);
 
   // Start in-game timer ONLY when entering PLAYING state
   useEffect(() => {
@@ -304,13 +202,21 @@ export default function App() {
     if (!map || !isMapReadyStateRef.current) return;
 
     const zone = zoneStateRef.current;
-    const isPlayingOrIntro = gameStateRef.current !== "INITIAL";
+    const isPlayingOrIntro =
+      gameStateRef.current !== "LANDING" &&
+      gameStateRef.current !== "JOIN_ROOM" &&
+      gameStateRef.current !== "ROOM";
 
     // 1. Glowing perimeter circle
     const glowSource = map.getSource("glowing-circle-source");
     if (glowSource) {
       if (zone && zone.radius > 0 && isPlayingOrIntro) {
-        const circlePolyCoords = createCircleGeoJSON(zone.center[0], zone.center[1], zone.radius, 128);
+        const circlePolyCoords = createCircleGeoJSON(
+          zone.center[0],
+          zone.center[1],
+          zone.radius,
+          128
+        );
         glowSource.setData({
           type: "FeatureCollection",
           features: [
@@ -783,6 +689,38 @@ export default function App() {
     syncMapGraphics();
   };
 
+  const updateMapTeamColor = (color) => {
+    ourTeamColorRef.current = color;
+    setOurTeamColor(color);
+
+    const map = mapRef.current;
+    if (!map) return;
+
+    [
+      "glowing-circle-outer",
+      "glowing-circle-mid",
+      "glowing-circle-core",
+      "shrink-origin-circle-outer",
+      "shrink-origin-circle-mid",
+      "shrink-origin-circle-core",
+      "dest-rings-layer",
+      "vision-circles-stroke",
+    ].forEach((layerId) => {
+      if (map.getLayer(layerId)) {
+        map.setPaintProperty(layerId, "line-color", color);
+      }
+    });
+
+    if (map.getLayer("vision-circles-fill")) {
+      map.setPaintProperty("vision-circles-fill", "fill-color", color);
+    }
+
+    markersRef.current.forEach((marker) => {
+      const el = marker.getElement();
+      el.style.filter = `drop-shadow(0 0 6px ${color})`;
+    });
+  };
+
   useEffect(() => {
     if (!mapContainerRef.current) return;
 
@@ -807,7 +745,7 @@ export default function App() {
 
     mapRef.current = map;
 
-    // Disallow zooming when initially selecting color
+    // Disallow zooming in lobby
     map.scrollZoom.disable();
     map.doubleClickZoom.disable();
     map.touchZoomRotate.disable();
@@ -896,13 +834,17 @@ export default function App() {
 
       initGraph()
         .then(async ({ bbox }) => {
-          const opponentTeamColors = TEAM_COLORS.filter((c) => c !== ourTeamColorRef.current);
+          const opponentTeamColors = TEAM_COLORS.filter(
+            (c) => c !== ourTeamColorRef.current
+          );
           const opponentPromises = [];
 
           opponentTeamColors.forEach((tColor) => {
             DOT_CONFIGS.forEach((cfg) => {
-              const randLat = bbox[0][0] + Math.random() * (bbox[1][0] - bbox[0][0]);
-              const randLon = bbox[0][1] + Math.random() * (bbox[1][0] - bbox[0][1]);
+              const randLat =
+                bbox[0][0] + Math.random() * (bbox[1][0] - bbox[0][0]);
+              const randLon =
+                bbox[0][1] + Math.random() * (bbox[1][1] - bbox[0][1]);
               opponentPromises.push(
                 snap(randLat, randLon).then((res) => ({
                   pt: res.pt,
@@ -952,7 +894,7 @@ export default function App() {
       const dt = (now - lastTime) / 1000.0;
       lastTime = now;
 
-      // 1. 3-SECOND CIRCLE EXPANSION SEQUENCE
+      // 1. INTRO
       if (gameStateRef.current === "INTRO") {
         const elapsed = now - introStartRef.current;
         const progress = Math.min(1.0, elapsed / 3000.0);
@@ -992,7 +934,7 @@ export default function App() {
         }
       }
 
-      // 2. 5-SECOND FOG FADE-IN
+      // 2. FOG FADE
       if (gameStateRef.current === "FOG_FADE") {
         const elapsed = now - fogFadeStartRef.current;
         const progress = Math.min(1.0, elapsed / 5000.0);
@@ -1031,7 +973,7 @@ export default function App() {
         }
       }
 
-      // 3. UNIT MOVEMENT IN PLAYING STATE
+      // 3. PLAYING
       if (gameStateRef.current === "PLAYING") {
         const isGameFinished = gameSecondsRef.current >= END_GAME_SECONDS;
 
@@ -1144,45 +1086,110 @@ export default function App() {
     return () => cancelAnimationFrame(animId);
   }, []);
 
-  const updateMapTeamColor = (color) => {
-    ourTeamColorRef.current = color;
-    setOurTeamColor(color);
+  // ---------------- MULTIPLAYER EVENT HANDLERS ----------------
+  const handleCreateRoom = (name) => {
+    const newCode = Math.floor(1000 + Math.random() * 9000).toString();
+    const myId = "p_1";
+    const myColor = pickRandomColor([]);
 
-    const map = mapRef.current;
-    if (!map) return;
+    const newRoom = {
+      code: newCode,
+      hostId: myId,
+      players: [
+        {
+          id: myId,
+          numericId: 1,
+          name,
+          color: myColor,
+        },
+      ],
+    };
 
-    [
-      "glowing-circle-outer",
-      "glowing-circle-mid",
-      "glowing-circle-core",
-      "shrink-origin-circle-outer",
-      "shrink-origin-circle-mid",
-      "shrink-origin-circle-core",
-      "dest-rings-layer",
-      "vision-circles-stroke",
-    ].forEach((layerId) => {
-      if (map.getLayer(layerId)) {
-        map.setPaintProperty(layerId, "line-color", color);
-      }
+    setLocalPlayerId(myId);
+    setRoomData(newRoom);
+    updateMapTeamColor(myColor);
+
+    gameStateRef.current = "ROOM";
+    setGameState("ROOM");
+
+    tobackend({ action: "CREATE_ROOM", playerName: name, room: newRoom });
+  };
+
+  const handleJoinRoomSubmit = (code) => {
+    const myId = `p_${Date.now() % 1000}`;
+    const players = [{ id: "p_host", numericId: 1, name: "Alice", color: pickRandomColor([])}];
+    players.push({ id: "p_2", numericId: 2, name: "Andrew", color: pickRandomColor(players)});
+    const myColor = pickRandomColor(players);
+    players.push({ id: myId, numericId: 3, name: playerName, color: myColor});
+    
+
+    // Mock existing room with 2 other players
+    const mockRoom = {
+      code,
+      hostId: "p_host",
+      players: players,
+    };
+
+    setLocalPlayerId(myId);
+    setRoomData(mockRoom);
+    updateMapTeamColor(myColor);
+
+    gameStateRef.current = "ROOM";
+    setGameState("ROOM");
+
+    tobackend({
+      action: "JOIN_ROOM",
+      roomCode: code,
+      playerName,
+      player: { id: myId, name: playerName, color: myColor },
     });
+  };
 
-    if (map.getLayer("vision-circles-fill")) {
-      map.setPaintProperty("vision-circles-fill", "fill-color", color);
+  const handleLeaveRoom = () => {
+    tobackend({ action: "LEAVE_ROOM", roomCode: roomData?.code, localPlayerId });
+    setRoomData(null);
+    setLocalPlayerId(null);
+    gameStateRef.current = "LANDING";
+    setGameState("LANDING");
+  };
+
+  const handleReassignHost = () => {
+    if (!roomData || roomData.players.length <= 1) return;
+    const otherPlayers = roomData.players.filter((p) => p.id !== roomData.hostId);
+    const nextHost = otherPlayers[0];
+
+    const updated = {
+      ...roomData,
+      hostId: nextHost.id,
+    };
+    setRoomData(updated);
+
+    tobackend({ action: "REASSIGN_HOST", roomCode: roomData.code, newHostId: nextHost.id });
+  };
+
+  const handleSelectRoomColor = (newColor) => {
+    updateMapTeamColor(newColor);
+
+    if (roomData && localPlayerId) {
+      const updatedPlayers = roomData.players.map((p) =>
+        p.id === localPlayerId ? { ...p, color: newColor } : p
+      );
+      setRoomData({
+        ...roomData,
+        players: updatedPlayers,
+      });
+
+      tobackend({
+        action: "CHANGE_COLOR",
+        roomCode: roomData.code,
+        playerId: localPlayerId,
+        newColor,
+      });
     }
-
-    markersRef.current.forEach((marker) => {
-      const el = marker.getElement();
-      el.style.filter = `drop-shadow(0 0 6px ${color})`;
-    });
   };
 
-  const handleSelectTeamColor = (color) => {
-    setSelectedColor(color);
-    updateMapTeamColor(color);
-  };
-
-  const handlePressPlay = () => {
-    if (!selectedColor) return;
+  const handleStartGame = () => {
+    tobackend({ action: "START_GAME", roomCode: roomData?.code });
     introStartRef.current = performance.now();
     gameStateRef.current = "INTRO";
     setGameState("INTRO");
@@ -1600,7 +1607,9 @@ export default function App() {
         zoneUI.isShrinking ? "⏸️" : "⏩"
       } at ${formatEtaRounded(zoneUI.targetEndSec)})`;
 
-  const isHUDVisible = hudSlidingIn || (gameState !== "INITIAL" && gameState !== "INTRO");
+  const isHUDVisible =
+    hudSlidingIn ||
+    (!isLobbyState && gameState !== "INTRO");
 
   return (
     <div
@@ -1635,36 +1644,34 @@ export default function App() {
         }}
       />
 
-      {/* MULTIPLAYER LOBBY FLOW */}
-      <MultiplayerModals
-        multiplayerPage={multiplayerPage}
+      {/* UNIFIED MODALS & OVERLAYS */}
+      <GameModals
+        gameState={gameState}
         playerName={playerName}
         setPlayerName={setPlayerName}
         roomData={roomData}
         localPlayerId={localPlayerId}
+        ourTeamColor={ourTeamColor}
+        placedHuntersCount={placedHuntersCount}
+        runnerPlaced={runnerPlaced}
+        countdownNumber={countdownNumber}
         onCreateRoom={handleCreateRoom}
         onJoinRoomSubmit={handleJoinRoomSubmit}
         onLeaveRoom={handleLeaveRoom}
         onReassignHost={handleReassignHost}
         onStartGame={handleStartGame}
-        onNavigateToJoin={() => setMultiplayerPage("JOIN_ROOM")}
-        onBackToLanding={() => setMultiplayerPage("LANDING")}
-        onSelectTeamColor={handleRoomColorSelect}
-      />
-
-      {/* EXTRACTED PRE-GAME MODALS & OVERLAYS */}
-      {/* <PreGameModals
-        gameState={gameState}
-        selectedColor={selectedColor}
-        ourTeamColor={ourTeamColor}
-        placedHuntersCount={placedHuntersCount}
-        runnerPlaced={runnerPlaced}
-        countdownNumber={countdownNumber}
-        onSelectTeamColor={handleSelectTeamColor}
-        onPressPlay={handlePressPlay}
+        onNavigateToJoin={() => {
+          gameStateRef.current = "JOIN_ROOM";
+          setGameState("JOIN_ROOM");
+        }}
+        onBackToLanding={() => {
+          gameStateRef.current = "LANDING";
+          setGameState("LANDING");
+        }}
+        onSelectTeamColor={handleSelectRoomColor}
         onConfirmHunters={handleConfirmHunters}
         onConfirmRunner={handleConfirmRunner}
-      /> */}
+      />
 
       {/* TOP CENTER: HEADER TEXT & PROGRESS BAR */}
       <div
@@ -1753,7 +1760,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* TOP-LEFT WHITE BUTTON */}
+      {/* TOP-LEFT WHITE BUTTON: ALWAYS VISIBLE */}
       <button
         onClick={handleToggleStyle}
         style={{
