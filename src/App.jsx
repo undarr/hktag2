@@ -2,6 +2,12 @@ import React, { useEffect, useRef, useState } from "react";
 import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { initGraph, snap, pathfind } from "./fetch";
+import PreGameModals from "./PreGameModals";
+import MultiplayerModals from "./MultiplayerModals";
+import {
+  tobackend,
+  pickRandomColor,
+} from "./multiplayerBackend";
 import {
   INITIAL_CIRCLE_CENTER_LAT,
   INITIAL_CIRCLE_CENTER_LON,
@@ -29,6 +35,115 @@ import {
 const GREY_STORM_COLOR = "#60646c";
 
 export default function App() {
+  const [multiplayerPage, setMultiplayerPage] = useState("LANDING");
+  const [playerName, setPlayerName] = useState("");
+  const [roomData, setRoomData] = useState(null);
+  const [localPlayerId, setLocalPlayerId] = useState(null);
+
+  // ---------------- MULTIPLAYER EVENT HANDLERS ----------------
+  const handleCreateRoom = (name) => {
+    const newCode = Math.floor(1000 + Math.random() * 9000).toString();
+    const myId = "p_1";
+    const myColor = pickRandomColor([]);
+
+    const newRoom = {
+      code: newCode,
+      hostId: myId,
+      players: [
+        {
+          id: myId,
+          numericId: 1,
+          name,
+          color: myColor,
+        },
+      ],
+    };
+
+    setLocalPlayerId(myId);
+    setRoomData(newRoom);
+    setOurTeamColor(myColor);
+    ourTeamColorRef.current = myColor;
+    setMultiplayerPage("ROOM");
+
+    tobackend({ action: "CREATE_ROOM", playerName: name, room: newRoom });
+  };
+
+  const handleJoinRoomSubmit = (code) => {
+    const myId = `p_${Date.now() % 1000}`;
+    const myColor = pickRandomColor([]);
+
+    // Mock existing room players for demonstration
+    const dummyRoom = {
+      code,
+      hostId: "p_host",
+      players: [
+        { id: "p_host", numericId: 1, name: "Alice", color: "#FF5722" },
+        { id: "p_2", numericId: 2, name: "Andrew", color: "#4CAF50" },
+        { id: myId, numericId: 3, name: playerName, color: myColor },
+      ],
+    };
+
+    setLocalPlayerId(myId);
+    setRoomData(dummyRoom);
+    setOurTeamColor(myColor);
+    ourTeamColorRef.current = myColor;
+    setMultiplayerPage("ROOM");
+
+    tobackend({ action: "JOIN_ROOM", roomCode: code, playerName, player: { id: myId, name: playerName } });
+  };
+
+  const handleLeaveRoom = () => {
+    tobackend({ action: "LEAVE_ROOM", roomCode: roomData?.code, localPlayerId });
+    setRoomData(null);
+    setLocalPlayerId(null);
+    setMultiplayerPage("LANDING");
+  };
+
+  const handleReassignHost = () => {
+    if (!roomData || roomData.players.length <= 1) return;
+    const otherPlayers = roomData.players.filter((p) => p.id !== roomData.hostId);
+    const nextHost = otherPlayers[0];
+
+    const updated = {
+      ...roomData,
+      hostId: nextHost.id,
+    };
+    setRoomData(updated);
+
+    tobackend({ action: "REASSIGN_HOST", roomCode: roomData.code, newHostId: nextHost.id });
+  };
+
+  const handleRoomColorSelect = (newColor) => {
+    // 1. Update Map and Team Colors
+    updateMapTeamColor(newColor);
+    setSelectedColor(newColor);
+
+    // 2. Update room player data state
+    if (roomData && localPlayerId) {
+      const updatedPlayers = roomData.players.map((p) =>
+        p.id === localPlayerId ? { ...p, color: newColor } : p
+      );
+      setRoomData({
+        ...roomData,
+        players: updatedPlayers,
+      });
+
+      // 3. Dispatch to backend
+      tobackend({
+        action: "CHANGE_COLOR",
+        roomCode: roomData.code,
+        playerId: localPlayerId,
+        newColor,
+      });
+    }
+  };
+
+  const handleStartGame = () => {
+    tobackend({ action: "START_GAME", roomCode: roomData.code });
+    setMultiplayerPage(null); // dismiss multiplayer modal
+    handlePressPlay(); // trigger existing intro sequence
+  };
+
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
   const isMapReadyStateRef = useRef(false);
@@ -43,7 +158,7 @@ export default function App() {
   const [gameState, setGameState] = useState("INITIAL");
   const gameStateRef = useRef("INITIAL");
 
-  // Dynamic fog opacity reference: 0.0 initially, fades 0.0 -> 1.0 over 5s after confirming runner
+  // Dynamic fog opacity reference
   const fogOpacityRef = useRef(0.0);
   const fogFadeStartRef = useRef(0);
 
@@ -857,7 +972,6 @@ export default function App() {
           originCenter: null,
         };
 
-        // Slide in top modal exactly 1 second before PLACE_HUNTERS mode (at 2000ms)
         if (elapsed >= 2000 && !hudSlidingInRef.current) {
           hudSlidingInRef.current = true;
           setHudSlidingIn(true);
@@ -882,7 +996,7 @@ export default function App() {
       if (gameStateRef.current === "FOG_FADE") {
         const elapsed = now - fogFadeStartRef.current;
         const progress = Math.min(1.0, elapsed / 5000.0);
-        fogOpacityRef.current = progress; // 0.0 -> 1.0
+        fogOpacityRef.current = progress;
 
         if (elapsed >= 5000) {
           fogOpacityRef.current = 1.0;
@@ -902,7 +1016,6 @@ export default function App() {
               gameStateRef.current = "PLAYING";
               setGameState("PLAYING");
 
-              // Reveal opponent units when the game starts
               const map = mapRef.current;
               if (map) {
                 const src = map.getSource("opponent-units");
@@ -1081,7 +1194,6 @@ export default function App() {
     setGameState("PLACE_RUNNER");
   };
 
-  // Confirm runner: start 5s fog fade, reveal clock and normal progress text immediately
   const handleConfirmRunner = () => {
     if (!runnerPlaced) return;
     unitsPlacedRef.current = true;
@@ -1471,19 +1583,15 @@ export default function App() {
 
   const displayedDiameter = formatRadiusDisplay(INITIAL_CIRCLE_RADIUS_METERS * 2);
 
-  // Determine whether top text should show hunter/runner placement or clock
   const isHunterPhaseText = gameState === "INTRO" || gameState === "PLACE_HUNTERS";
   const isRunnerPhaseText = gameState === "PLACE_RUNNER";
   const isStaticPlacementBar = isHunterPhaseText || isRunnerPhaseText;
-  const isActualPlacementInteraction = gameState === "PLACE_HUNTERS" || gameState === "PLACE_RUNNER";
 
-  // Top header text logic (displays "Place Your Hunters!" as it slides down 1s prior)
   let headerText = formatGameClock(gameSeconds);
   if (isHunterPhaseText) headerText = "Place Your Hunters!";
   else if (isRunnerPhaseText) headerText = "Place Your Runner!";
   else if (gameState === "FOG_FADE" || gameState === "COUNTDOWN") headerText = formatGameClock(START_GAME_SECONDS);
 
-  // Progress bar text logic (displays "Z1 ⏸️ ({d})" as it slides down 1s prior)
   let progressText = isStaticPlacementBar
     ? `Z1 ⏸️ (${displayedDiameter})`
     : `Z${zoneUI.phase} ${zoneUI.isShrinking ? "⏩" : "⏸️"} (${formatRadiusDisplay(
@@ -1492,7 +1600,6 @@ export default function App() {
         zoneUI.isShrinking ? "⏸️" : "⏩"
       } at ${formatEtaRounded(zoneUI.targetEndSec)})`;
 
-  // Modal visibility: drops down 1 second before PLACE_HUNTERS mode begins (at 2000ms)
   const isHUDVisible = hudSlidingIn || (gameState !== "INITIAL" && gameState !== "INTRO");
 
   return (
@@ -1528,132 +1635,38 @@ export default function App() {
         }}
       />
 
-      {/* 3x4 COLOR PICKER MODAL (INITIAL STATE) */}
-      {gameState === "INITIAL" && (
-        <div
-          style={{
-            position: "absolute",
-            top: "50%",
-            left: "50%",
-            transform: "translate(-50%, -50%)",
-            zIndex: 60,
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
-            padding: "24px 28px",
-            background: "rgba(18, 20, 24, 0.88)",
-            backdropFilter: "blur(14px)",
-            borderRadius: "20px",
-            border: `2px solid ${selectedColor || "rgba(255, 255, 255, 0.2)"}`,
-            boxShadow: selectedColor
-              ? `0 0 25px ${selectedColor}66, 0 8px 32px rgba(0,0,0,0.7)`
-              : "0 8px 32px rgba(0,0,0,0.7)",
-            fontFamily: "system-ui, -apple-system, sans-serif",
-            userSelect: "none",
-            transition: "border 0.2s ease, box-shadow 0.2s ease",
-          }}
-        >
-          <div
-            style={{
-              fontSize: "13px",
-              fontWeight: "700",
-              letterSpacing: "1.5px",
-              color: "#a0a5b0",
-              textTransform: "uppercase",
-              marginBottom: "16px",
-            }}
-          >
-            Select Team Color
-          </div>
+      {/* MULTIPLAYER LOBBY FLOW */}
+      <MultiplayerModals
+        multiplayerPage={multiplayerPage}
+        playerName={playerName}
+        setPlayerName={setPlayerName}
+        roomData={roomData}
+        localPlayerId={localPlayerId}
+        onCreateRoom={handleCreateRoom}
+        onJoinRoomSubmit={handleJoinRoomSubmit}
+        onLeaveRoom={handleLeaveRoom}
+        onReassignHost={handleReassignHost}
+        onStartGame={handleStartGame}
+        onNavigateToJoin={() => setMultiplayerPage("JOIN_ROOM")}
+        onBackToLanding={() => setMultiplayerPage("LANDING")}
+        onSelectTeamColor={handleRoomColorSelect}
+      />
 
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(4, 52px)",
-              gridTemplateRows: "repeat(3, 52px)",
-              gap: "12px",
-              marginBottom: "20px",
-            }}
-          >
-            {TEAM_COLORS.map((color) => {
-              const isSelected = selectedColor === color;
-              return (
-                <button
-                  key={color}
-                  onClick={() => handleSelectTeamColor(color)}
-                  style={{
-                    width: "52px",
-                    height: "52px",
-                    borderRadius: "14px",
-                    backgroundColor: color,
-                    border: isSelected
-                      ? "3.5px solid #ffffff"
-                      : "2px solid rgba(0, 0, 0, 0.4)",
-                    boxShadow: isSelected
-                      ? `0 0 14px ${color}, inset 0 0 4px rgba(0,0,0,0.4)`
-                      : "0 2px 6px rgba(0,0,0,0.3)",
-                    transform: isSelected ? "scale(1.08)" : "scale(1)",
-                    cursor: "pointer",
-                    outline: "none",
-                    padding: 0,
-                    transition: "transform 0.15s ease, border 0.15s ease, box-shadow 0.15s ease",
-                  }}
-                />
-              );
-            })}
-          </div>
+      {/* EXTRACTED PRE-GAME MODALS & OVERLAYS */}
+      {/* <PreGameModals
+        gameState={gameState}
+        selectedColor={selectedColor}
+        ourTeamColor={ourTeamColor}
+        placedHuntersCount={placedHuntersCount}
+        runnerPlaced={runnerPlaced}
+        countdownNumber={countdownNumber}
+        onSelectTeamColor={handleSelectTeamColor}
+        onPressPlay={handlePressPlay}
+        onConfirmHunters={handleConfirmHunters}
+        onConfirmRunner={handleConfirmRunner}
+      /> */}
 
-          <button
-            onClick={handlePressPlay}
-            disabled={!selectedColor}
-            style={{
-              padding: "10px 42px",
-              fontSize: "16px",
-              fontWeight: "800",
-              letterSpacing: "1px",
-              borderRadius: "24px",
-              border: "none",
-              backgroundColor: selectedColor ? selectedColor : "#3a3d45",
-              color: "#ffffff",
-              cursor: selectedColor ? "pointer" : "not-allowed",
-              boxShadow: selectedColor ? `0 4px 16px ${selectedColor}88` : "none",
-              opacity: selectedColor ? 1 : 0.4,
-              transition: "all 0.2s ease",
-              outline: "none",
-            }}
-          >
-            PLAY
-          </button>
-        </div>
-      )}
-
-      {/* COUNTDOWN NUMBER IN THE CENTER */}
-      {gameState === "COUNTDOWN" && (
-        <div
-          style={{
-            position: "absolute",
-            top: "50%",
-            left: "50%",
-            transform: "translate(-50%, -50%)",
-            zIndex: 80,
-            fontSize: "110px",
-            fontWeight: "900",
-            WebkitTextStroke: "6px #000000",
-            paintOrder: "stroke fill",
-            color: "#ffffff",
-            fontFamily: "system-ui, -apple-system, sans-serif",
-            fontVariantNumeric: "tabular-nums",
-            userSelect: "none",
-            pointerEvents: "none",
-            textShadow:
-              "-3px -3px 0 #000, 3px -3px 0 #000, -3px 3px 0 #000, 3px 3px 0 #000, 0 8px 24px rgba(0,0,0,0.9)",
-          }}
-        >
-          {countdownNumber}
-        </div>
-      )}
-
-      {/* TOP CENTER: HEADER TEXT & PROGRESS BAR (Slides in 1s before PLACE_HUNTERS mode) */}
+      {/* TOP CENTER: HEADER TEXT & PROGRESS BAR */}
       <div
         style={{
           position: "absolute",
@@ -1740,41 +1753,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* BOTTOM CONFIRM BUTTON */}
-      {isActualPlacementInteraction && (
-        <button
-          onClick={gameState === "PLACE_HUNTERS" ? handleConfirmHunters : handleConfirmRunner}
-          disabled={gameState === "PLACE_HUNTERS" ? placedHuntersCount < 3 : !runnerPlaced}
-          style={{
-            position: "absolute",
-            bottom: "calc(24px + env(safe-area-inset-bottom, 0px))",
-            left: "50%",
-            transform: "translateX(-50%)",
-            padding: "12px 42px",
-            fontSize: "16px",
-            fontWeight: "800",
-            letterSpacing: "1.2px",
-            borderRadius: "28px",
-            border: "none",
-            backgroundColor: ourTeamColor,
-            color: "#ffffff",
-            boxShadow: `0 4px 20px ${ourTeamColor}88, 0 2px 8px rgba(0,0,0,0.6)`,
-            cursor:
-              (gameState === "PLACE_HUNTERS" ? placedHuntersCount >= 3 : runnerPlaced)
-                ? "pointer"
-                : "not-allowed",
-            opacity:
-              (gameState === "PLACE_HUNTERS" ? placedHuntersCount >= 3 : runnerPlaced) ? 1 : 0.45,
-            zIndex: 60,
-            transition: "all 0.2s ease",
-            outline: "none",
-          }}
-        >
-          CONFIRM
-        </button>
-      )}
-
-      {/* TOP-LEFT WHITE BUTTON: NEVER DISAPPEARS */}
+      {/* TOP-LEFT WHITE BUTTON */}
       <button
         onClick={handleToggleStyle}
         style={{
